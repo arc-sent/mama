@@ -1,0 +1,14 @@
+services:
+  mother:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # в контейнере API слушает все интерфейсы, а наружу порт публикуется только на localhost
+      # сервера: дальше его выставляет HTTPS-прокси (deploy/Caddyfile) или Tailscale
+      MOTHER_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./data:/app/data
+      - ./videos:/app/videos

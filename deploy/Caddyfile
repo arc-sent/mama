@@ -1,0 +1,5 @@
+# HTTPS для API mother, если выставляете его в интернет (Caddy сам получит сертификат).
+# mother.example.com замените на свой домен, у которого A-запись указывает на сервер.
+mother.example.com {
+    reverse_proxy 127.0.0.1:8787
+}

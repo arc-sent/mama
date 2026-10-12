@@ -1,0 +1,8 @@
+.env
+data/
+videos/
+tests/
+__pycache__/
+.pytest_cache/
+*.log
+*.mp4
