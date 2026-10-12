@@ -34,6 +34,8 @@ import vk_link  # noqa: E402
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# httpx пишет каждый запрос к Telegram вместе с адресом, а в адресе — токен бота: в логи не нужно
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("mother")
 
 BTN_GROUPS, BTN_SOURCES, BTN_RULES = "👥 Группы", "🎬 Источники", "📋 Правила"
