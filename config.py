@@ -26,6 +26,11 @@ DEEPEN_MAX_PASSES = int(os.getenv("DEEPEN_MAX_PASSES", "3"))
 # видео не скачалась (битая ссылка, слишком длинное и т.п.).
 PREPARE_ROUNDS = int(os.getenv("PREPARE_ROUNDS", "3"))
 
+# /nolimit N: сколько видео можно запросить за раз (защита от опечатки вроде 100000) и сколько
+# места в среднем занимает одно видео при проверке «хватит ли диска».
+NOLIMIT_MAX = int(os.getenv("NOLIMIT_MAX", "500"))
+NOLIMIT_MB_PER_VIDEO = int(os.getenv("NOLIMIT_MB_PER_VIDEO", "20"))
+
 # API для ПК с браузерными профилями: отдаёт план и видео, принимает результат выкладки.
 # Включается, если задан MOTHER_API_TOKEN. По умолчанию слушает только свой компьютер;
 # наружу его выставляют через HTTPS-прокси или закрытую сеть (Tailscale/WireGuard).

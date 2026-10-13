@@ -355,6 +355,22 @@ async def prepare_all(app, extra: int = 0, telegram_id: int | None = None) -> No
 PLANS_DIR = os.path.join(db.DATA_DIR, "plans")
 
 
+def parse_count(arg: str, maximum: int) -> int | None:
+    """'25' / '+25' -> 25; None, если это не число от 1 до maximum."""
+    arg = (arg or "").strip().lstrip("+")
+    return int(arg) if arg.isdigit() and 1 <= int(arg) <= maximum else None
+
+
+def disk_check(n_videos: int, free_bytes: int, mb_per_video: int | None = None) -> str | None:
+    """Текст отказа, если места на диске заведомо не хватит на n_videos; иначе None."""
+    mb = mb_per_video or config.NOLIMIT_MB_PER_VIDEO
+    need, spare = n_videos * mb * 1024 * 1024, 512 * 1024 * 1024   # +0,5 ГБ запаса
+    if free_bytes - spare >= need:
+        return None
+    return (f"Не хватит места на диске: для {n_videos} видео нужно примерно {need / 1e9:.1f} ГБ "
+            f"(по {mb} МБ на видео), свободно {free_bytes / 1e9:.1f} ГБ. Возьмите меньше.")
+
+
 def quota_report(telegram_id: int, now: datetime | None = None) -> str:
     """Сколько видео по каждому включённому правилу уже выдано на ближайший день выдачи."""
     day = delivery_day(now)

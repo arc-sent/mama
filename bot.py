@@ -99,7 +99,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 mother готовит видео и в "
         f"{config.DELIVER_HOUR:02d}:{config.DELIVER_MINUTE:02d} МСК присылает JSON-план.\n\n"
         "1) 👥 добавь группы (числовой id)\n2) 🎬 добавь источники\n"
-        "3) 📋 свяжи их правилами\n\n/plan — получить план прямо сейчас.",
+        "3) 📋 свяжи их правилами\n\n/plan — получить план прямо сейчас.\n"
+        "/nolimit 20 — выдать 20 видео без дневной нормы.",
         reply_markup=MENU,
     )
 
@@ -128,6 +129,9 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     нормы (для проверок); норма следующего дня от этого не уменьшается."""
     uid = update.effective_user.id
     extra = 0
+    if context.args and context.args[0].lower() in ("nolimit", "no-limit"):     # /plan nolimit N
+        context.args = context.args[1:]
+        return await cmd_nolimit(update, context)
     if context.args:
         arg = context.args[0].lstrip("+")
         if not arg.isdigit() or not 1 <= int(arg) <= 10:
@@ -141,6 +145,55 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else "⏳ Готовых видео нет — готовлю, это может занять время…")
         await scheduler.prepare_all(context.application, extra=extra, telegram_id=uid)
     await scheduler.deliver_plan(context.bot, uid)
+
+
+async def cmd_nolimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/nolimit N — выдать N видео по каждому правилу без дневной нормы (до NOLIMIT_MAX).
+
+    Подготовка идёт в фоне: бот остаётся отзывчивым, а когда всё скачано, присылает план.
+    Повторяющихся видео не будет, норма следующего дня не страдает."""
+    uid = update.effective_user.id
+    n = scheduler.parse_count(context.args[0], config.NOLIMIT_MAX) if context.args else None
+    if n is None:
+        await update.message.reply_text(
+            f"Использование: /nolimit N — выдать N видео по каждому правилу без дневной нормы "
+            f"(N от 1 до {config.NOLIMIT_MAX}). Например: /nolimit 20")
+        return
+    running = context.application.bot_data.setdefault("nolimit_running", set())
+    if uid in running:
+        await update.message.reply_text("⏳ Предыдущий /nolimit ещё готовится, дождитесь плана.")
+        return
+    import shutil
+    os.makedirs(config.VIDEO_DIR, exist_ok=True)
+    refusal = scheduler.disk_check(n * max(1, len(db.get_rules(uid))), shutil.disk_usage(config.VIDEO_DIR).free)
+    if refusal:
+        await update.message.reply_text("❌ " + refusal)
+        return
+    await update.message.reply_text(
+        f"⏳ Готовлю {n} видео по каждому правилу без дневной нормы. Скачивание идёт в фоне, "
+        f"это может занять несколько минут; план пришлю, когда всё будет готово. "
+        f"Бот пока отвечает на другие команды.")
+    running.add(uid)
+
+    async def job():
+        try:
+            before = len(db.get_queue("ready", uid))
+            await scheduler.prepare_all(context.application, extra=n, telegram_id=uid)
+            ready = len(db.get_queue("ready", uid)) - before
+            await context.bot.send_message(uid, f"✅ Готово видео: {max(ready, 0)}. Отправляю план.")
+            await scheduler.deliver_plan(context.bot, uid)
+        except Exception:
+            logger.exception("/nolimit упал")
+            try:
+                await context.bot.send_message(uid, "⚠️ Не получилось подготовить видео, подробности в /errors.")
+            except Exception:
+                pass
+        finally:
+            running.discard(uid)
+
+    task = asyncio.create_task(job())
+    context.application.bot_data.setdefault("tasks", set()).add(task)     # без ссылки задачу съест сборщик мусора
+    task.add_done_callback(context.application.bot_data["tasks"].discard)
 
 
 async def cmd_testplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -793,6 +846,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("plan", cmd_plan))
+    app.add_handler(CommandHandler("nolimit", cmd_nolimit))
     app.add_handler(CommandHandler("testplan", cmd_testplan))
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("templates", show_templates))
