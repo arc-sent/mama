@@ -122,18 +122,25 @@ async def _process(file_path: str, telegram_id: int, *, url: str | None = None,
 
 # ─── Планирование правила ─────────────────────────────────────────────────────
 
-def plan_rule(rule, now: datetime | None = None) -> int:
+def plan_rule(rule, now: datetime | None = None, extra: int = 0) -> int:
     """Поставить в очередь остаток дневной нормы правила. Вернуть число добавленных.
 
     Норма — N видео на день выдачи: считаем всё, что уже стоит в очереди на этот
     день (в том числе выданное), и добираем только остаток. Иначе стартовый прогон
     и утренний job задвоили бы выдачу.
+
+    ``extra`` > 0 — принудительно взять ещё столько видео СВЕРХ нормы (для проверок). Такие
+    видео помечаются днём ``<день>+extra`` и в норму не засчитываются: завтрашняя
+    выдача от них не пострадает. Повторы по-прежнему исключаются.
     """
     from source_reader import fetch_candidates, SourceError
 
     rule_id = rule["id"]
     day = delivery_day(now)
-    remaining = rule["videos_per_day"] - db.count_queue_for_day(rule_id, day)
+    if extra > 0:
+        remaining, plan_day = extra, f"{day}+extra"
+    else:
+        remaining, plan_day = rule["videos_per_day"] - db.count_queue_for_day(rule_id, day), day
     if remaining <= 0:
         return 0
 
@@ -164,7 +171,7 @@ def plan_rule(rule, now: datetime | None = None) -> int:
         item_id = db.add_queue_item(
             telegram_id=rule["telegram_id"], rule_id=rule_id,
             tt_video_id=video["tt_video_id"], url=video["url"],
-            title=video["title"], plan_day=day, video_description=video.get("description"),
+            title=video["title"], plan_day=plan_day, video_description=video.get("description"),
         )
         if item_id is not None:
             added += 1
@@ -312,8 +319,11 @@ async def ensure_backlog(context_or_app) -> int:
     return deepened
 
 
-async def prepare_all(app) -> None:
-    """Утренняя подготовка: до-парсинг, планирование и скачивание (с догоном при сбоях)."""
+async def prepare_all(app, extra: int = 0, telegram_id: int | None = None) -> None:
+    """Утренняя подготовка: до-парсинг, планирование и скачивание (с догоном при сбоях).
+
+    extra > 0 — взять по каждому правилу (пользователя telegram_id, если задан) ещё столько
+    видео сверх дневной нормы; только в первом раунде, повторные раунды — обычные."""
     try:
         await refresh_account_sources(app)
         await ensure_backlog(app)
@@ -321,11 +331,14 @@ async def prepare_all(app) -> None:
         logger.exception("Ошибка до-парсинга аккаунтов")
 
     loop = asyncio.get_running_loop()
-    for _ in range(config.PREPARE_ROUNDS):
+    for round_no in range(config.PREPARE_ROUNDS):
         planned = 0
         for rule in db.get_enabled_rules():
+            if telegram_id is not None and rule["telegram_id"] != telegram_id:
+                continue
             try:
-                planned += await loop.run_in_executor(None, plan_rule, rule)
+                n_extra = extra if round_no == 0 else 0
+                planned += await loop.run_in_executor(None, plan_rule, rule, None, n_extra)
             except Exception:
                 logger.exception("Ошибка планирования правила %s", rule["id"])
         # pending могли остаться и от прошлого прогона (рестарт посреди скачивания)
@@ -342,13 +355,30 @@ async def prepare_all(app) -> None:
 PLANS_DIR = os.path.join(db.DATA_DIR, "plans")
 
 
+def quota_report(telegram_id: int, now: datetime | None = None) -> str:
+    """Сколько видео по каждому включённому правилу уже выдано на ближайший день выдачи."""
+    day = delivery_day(now)
+    lines = []
+    for rule in db.get_rules(telegram_id):
+        if rule["enabled"]:
+            used = db.count_queue_for_day(rule["id"], day)
+            lines.append(f"• {rule['source_name']} → {rule['group_name']}: {used} из {rule['videos_per_day']}")
+    return f"Дневная норма на {day}:\n" + "\n".join(lines) if lines else ""
+
+
 async def deliver_plan(bot, telegram_id: int, *, notify_empty: bool = True) -> bool:
     """Собрать JSON из готовых видео пользователя и отправить файлом. True — отправлено."""
     items = db.get_queue("ready", telegram_id)
     if not items:
         if notify_empty:
+            text = "📭 План пуст: готовых видео нет."
+            report = quota_report(telegram_id)
+            if report:
+                text += ("\n\n" + report + "\n\nЕсли норма уже выдана, новых видео до следующего дня не будет. "
+                         "Чтобы получить ещё сейчас: /plan 2 (ещё 2 видео сверх нормы по каждому правилу) "
+                         "или увеличьте «видео в день» в правиле.")
             try:
-                await bot.send_message(telegram_id, "📭 План пуст: готовых видео нет.")
+                await bot.send_message(telegram_id, text)
             except Exception:
                 logger.exception("Не удалось отправить уведомление о пустом плане")
         return False

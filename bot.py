@@ -122,11 +122,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Выдать план сейчас: если очередь пуста — сперва подготовить."""
+    """Выдать план сейчас: если очередь пуста — сперва подготовить.
+
+    /plan N (N от 1 до 10) — принудительно взять ещё N видео по каждому правилу СВЕРХ дневной
+    нормы (для проверок); норма следующего дня от этого не уменьшается."""
     uid = update.effective_user.id
-    if not db.get_queue("ready", uid):
-        await update.message.reply_text("⏳ Готовых видео нет — готовлю, это может занять время…")
-        await scheduler.prepare_all(context.application)
+    extra = 0
+    if context.args:
+        arg = context.args[0].lstrip("+")
+        if not arg.isdigit() or not 1 <= int(arg) <= 10:
+            await update.message.reply_text("Использование: /plan — обычный план, /plan 2 — ещё 2 видео "
+                                            "сверх нормы по каждому правилу (от 1 до 10).")
+            return
+        extra = int(arg)
+    if extra or not db.get_queue("ready", uid):
+        await update.message.reply_text(
+            f"⏳ Беру ещё {extra} видео сверх нормы и готовлю, это может занять время…" if extra
+            else "⏳ Готовых видео нет — готовлю, это может занять время…")
+        await scheduler.prepare_all(context.application, extra=extra, telegram_id=uid)
     await scheduler.deliver_plan(context.bot, uid)
 
 

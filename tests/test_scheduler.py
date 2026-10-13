@@ -111,3 +111,29 @@ def test_plan_ids_increment(user_group_source, tmp_path):
         _make_ready(tmp_path)
         asyncio.run(scheduler.deliver_plan(bot, uid))
     assert [d[2]["id"] for d in bot.documents] == [1, 2]
+
+
+# ─── принудительно сверх нормы и объяснение пустого плана ──────────────────────
+
+def test_extra_videos_go_beyond_quota_and_do_not_eat_tomorrows(user_group_source, tmp_path):
+    rule = _rule(user_group_source, tmp_path, n_videos=8, per_day=2)
+    assert scheduler.plan_rule(rule, MORNING) == 2                  # обычная норма
+    assert scheduler.plan_rule(rule, MORNING) == 0                  # больше нормы нет
+    assert scheduler.plan_rule(rule, MORNING, extra=3) == 3         # а принудительно — есть
+    assert db.count_queue_for_day(rule["id"], "2025-01-10") == 2    # норма дня не изменилась
+    days = sorted({i["plan_day"] for i in db.get_queue("pending")})
+    assert days == ["2025-01-10", "2025-01-10+extra"]
+    assert len({i["tt_video_id"] for i in db.get_queue("pending")}) == 5     # повторов нет
+    assert scheduler.plan_rule(rule, MORNING, extra=0) == 0         # обычный прогон по-прежнему пуст
+
+
+def test_empty_plan_explains_the_daily_quota(user_group_source, tmp_path):
+    uid = user_group_source["telegram_id"]
+    rule = _rule(user_group_source, tmp_path, per_day=2)
+    scheduler.plan_rule(rule, MORNING)
+    _deliver_all_pending()
+    bot = FakeBot()
+    assert asyncio.run(scheduler.deliver_plan(bot, uid)) is False
+    text = bot.messages[0][1]
+    assert "План пуст" in text and "из 2" in text and "/plan 2" in text
+    assert scheduler.quota_report(uid, MORNING).startswith("Дневная норма на 2025-01-10")
