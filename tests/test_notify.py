@@ -22,9 +22,10 @@ def test_summary_text_has_everything_important():
     assert "✅ КИТИК ФАН: видео 5, id на сайте 10088" in text
     assert "❌ КИТИК ФАН: видео 6 — site: слишком много загрузок" in text
     assert "⚠️ Не скачалось на ПК: видео 8 — не скачалось" in text
-    assert "Оценка человекоподобности: 86% (человек)" in text
-    assert "2 перерыв(а), 5,5 мин, лайков 5, репостов 3" in text
-    assert "Завершено: 2026-10-13 15:29:31" in text
+    # оценка детектора, ленты между видео и время завершения в сообщение не входят
+    assert "Оценка" not in text and "человекоподоб" not in text and "86%" not in text
+    assert "Лента" not in text and "перерыв" not in text and "репост" not in text
+    assert "Завершено" not in text and "15:29" not in text
 
 
 def test_headline_by_outcome():
@@ -32,7 +33,6 @@ def test_headline_by_outcome():
     none = {"groups": [{"name": "Г", "videos": [{"id": 1, "status": "failed"}]}]}
     assert notify.format_result(1, ok).startswith("✅")
     assert notify.format_result(1, none).startswith("❌")
-    assert "Оценка" not in notify.format_result(1, ok)                    # нет данных — нет строки
     assert notify.format_result(1, {}).startswith("❌")                   # пустой итог не роняет
 
 
