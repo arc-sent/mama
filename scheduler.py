@@ -17,6 +17,7 @@ from datetime import datetime, time as dtime, timedelta
 
 import config
 import db
+import notify
 import plan_files
 import video_processor
 from config import MOSCOW_TZ
@@ -490,6 +491,34 @@ async def cleanup_job(context) -> None:
     cleanup_acked()
 
 
+async def notify_results(bot) -> int:
+    """Написать в Telegram об итогах выкладки, которые прислал ПК и о которых ещё не писали.
+
+    Помечает план как «сообщено» только после успешной отправки: при сбое Telegram попробуем снова.
+    Возвращает число отправленных уведомлений."""
+    sent = 0
+    for row in db.get_unnotified_results():
+        try:
+            text = notify.format_result(row["id"], json.loads(row["result"]))
+        except Exception:
+            logger.exception("Итог плана %s не разобрать — помечаю как сообщённый", row["id"])
+            db.mark_plan_notified(row["id"])
+            continue
+        try:
+            await bot.send_message(row["telegram_id"], text)
+        except Exception:
+            logger.exception("Не удалось отправить итог плана %s, повторю позже", row["id"])
+            continue
+        db.mark_plan_notified(row["id"])
+        sent += 1
+        logger.info("Итог плана %s отправлен пользователю %s", row["id"], row["telegram_id"])
+    return sent
+
+
+async def notify_job(context) -> None:
+    await notify_results(context.bot)
+
+
 async def deliver_job(context) -> None:
     if is_paused():
         logger.info("Выдача плана пропущена: пауза")
@@ -538,6 +567,8 @@ async def restore_and_schedule(app) -> None:
 
 
 def register_jobs(app) -> None:
+    # итоги выкладки с ПК -> сообщение в Telegram (проверка раз в 20 секунд)
+    app.job_queue.run_repeating(notify_job, interval=20, first=10, name="notify_results")
     app.job_queue.run_daily(
         cleanup_job, time=dtime(hour=4, minute=0, tzinfo=MOSCOW_TZ), name="cleanup")
     app.job_queue.run_daily(

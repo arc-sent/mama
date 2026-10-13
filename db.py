@@ -115,7 +115,8 @@ def init_db() -> None:
                 body        TEXT NOT NULL,
                 result      TEXT,                               -- ответ ПК: что выложено
                 acked_at    INTEGER,
-                cleaned     INTEGER NOT NULL DEFAULT 0          -- файлы плана уже удалены
+                cleaned     INTEGER NOT NULL DEFAULT 0,         -- файлы плана уже удалены
+                notified    INTEGER NOT NULL DEFAULT 0          -- об итоге выкладки уже написали в Telegram
             );
 
             CREATE TABLE IF NOT EXISTS description_templates (
@@ -156,6 +157,10 @@ def init_db() -> None:
                           ("cleaned", "INTEGER NOT NULL DEFAULT 0")):
             if col not in plan_cols:
                 conn.execute(f"ALTER TABLE plans ADD COLUMN {col} {defn}")
+        if "notified" not in plan_cols:
+            conn.execute("ALTER TABLE plans ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
+            # итоги, пришедшие до появления уведомлений, повторно не присылаем
+            conn.execute("UPDATE plans SET notified = 1 WHERE result IS NOT NULL")
         queue_cols = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
         if "video_description" not in queue_cols:
             conn.execute("ALTER TABLE queue ADD COLUMN video_description TEXT")
@@ -491,6 +496,19 @@ def set_plan_result(plan_id: int, result: dict) -> bool:
             (json.dumps(result, ensure_ascii=False), int(time.time()), plan_id),
         )
         return cur.rowcount > 0
+
+
+def get_unnotified_results() -> list[sqlite3.Row]:
+    """Планы, итог которых пришёл с ПК, а в Telegram о нём ещё не написали."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM plans WHERE result IS NOT NULL AND notified = 0 ORDER BY id"
+        ).fetchall()
+
+
+def mark_plan_notified(plan_id: int) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE plans SET notified = 1 WHERE id = ?", (plan_id,))
 
 
 def get_plans_to_clean(acked_before_ts: int) -> list[sqlite3.Row]:
