@@ -137,3 +137,49 @@ def test_empty_plan_explains_the_daily_quota(user_group_source, tmp_path):
     text = bot.messages[0][1]
     assert "План пуст" in text and "из 2" in text and "/plan 2" in text
     assert scheduler.quota_report(uid, MORNING).startswith("Дневная норма на 2025-01-10")
+
+
+# ─── обнуление дневной нормы (/resetquota) ────────────────────────────────────
+
+def test_reset_quota_frees_the_day_without_repeating_delivered_videos(user_group_source, tmp_path):
+    uid = user_group_source["telegram_id"]
+    rule = _rule(user_group_source, tmp_path, n_videos=8, per_day=2)
+    assert scheduler.plan_rule(rule, MORNING) == 2                   # норма дня выбрана
+    first = {i["tt_video_id"] for i in db.get_queue("pending")}
+    _deliver_all_pending()                                           # и выдана (как ручной /plan)
+    assert scheduler.plan_rule(rule, MORNING) == 0                   # завтра бы ничего не дали
+
+    day, freed = scheduler.reset_quota(uid, MORNING)
+    assert (day, freed) == ("2025-01-10", 2)
+    assert db.count_queue_for_day(rule["id"], "2025-01-10") == 0     # норма снова пуста
+
+    assert scheduler.plan_rule(rule, MORNING) == 2                   # свежая порция
+    second = {i["tt_video_id"] for i in db.get_queue("pending")}
+    assert not (first & second)                                      # прежние видео не повторились
+    assert scheduler.plan_rule(rule, MORNING) == 0                   # а норма снова ограничена
+
+
+def test_reset_quota_touches_only_this_day_and_user(user_group_source, tmp_path):
+    uid = user_group_source["telegram_id"]
+    rule = _rule(user_group_source, tmp_path, n_videos=8, per_day=2)
+    scheduler.plan_rule(rule, MORNING)                               # день 2025-01-10
+    scheduler.plan_rule(rule, MORNING, extra=1)                      # 2025-01-10+extra
+    db.ensure_user(2002)
+    assert scheduler.reset_quota(2002, MORNING)[1] == 0              # у другого пользователя нечего сбрасывать
+    assert scheduler.reset_quota(uid, MORNING)[1] == 2               # extra-запись не затронута
+    days = sorted({i["plan_day"] for i in db.get_queue("pending")})
+    assert days == ["2025-01-10+extra", "2025-01-10+reset"]
+
+
+def test_resetquota_command_reports_both_cases(user_group_source, tmp_path):
+    import bot
+    from unittest.mock import AsyncMock, MagicMock
+
+    rule = _rule(user_group_source, tmp_path, n_videos=8, per_day=2)
+    scheduler.plan_rule(rule, scheduler.datetime.now(MSK))           # реальный «сейчас» — как в боте
+    update = MagicMock(); update.effective_user.id = user_group_source["telegram_id"]
+    update.message.reply_text = AsyncMock()
+    asyncio.run(bot.cmd_resetquota(update, MagicMock()))
+    assert "обнулена" in update.message.reply_text.call_args[0][0]
+    asyncio.run(bot.cmd_resetquota(update, MagicMock()))
+    assert "и так пуста" in update.message.reply_text.call_args[0][0]

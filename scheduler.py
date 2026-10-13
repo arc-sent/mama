@@ -356,6 +356,16 @@ async def prepare_all(app, extra: int = 0, telegram_id: int | None = None) -> No
 PLANS_DIR = os.path.join(db.DATA_DIR, "plans")
 
 
+def reset_quota(telegram_id: int, now: datetime | None = None) -> tuple[str, int]:
+    """Обнулить дневную норму ближайшего дня выдачи. Вернуть (день, сколько записей освобождено).
+
+    Нужно в период тестов: ручные /plan засчитываются в норму ближайшего дня и могут «съесть» плановую
+    выдачу. После сброса утренняя подготовка и /plan снова берут полную норму. Уже выданные видео
+    повторно не придут (журнал выдачи не трогается)."""
+    day = delivery_day(now)
+    return day, db.reset_queue_day(telegram_id, day)
+
+
 def parse_count(arg: str, maximum: int) -> int | None:
     """'25' / '+25' -> 25; None, если это не число от 1 до maximum."""
     arg = (arg or "").strip().lstrip("+")

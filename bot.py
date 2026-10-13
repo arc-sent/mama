@@ -100,7 +100,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{config.DELIVER_HOUR:02d}:{config.DELIVER_MINUTE:02d} МСК присылает JSON-план.\n\n"
         "1) 👥 добавь группы (числовой id)\n2) 🎬 добавь источники\n"
         "3) 📋 свяжи их правилами\n\n/plan — получить план прямо сейчас.\n"
-        "/nolimit 20 — выдать 20 видео без дневной нормы.",
+        "/nolimit 20 — выдать 20 видео без дневной нормы.\n"
+        "/resetquota — обнулить норму ближайшего дня (на время тестов).",
         reply_markup=MENU,
     )
 
@@ -145,6 +146,21 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else "⏳ Готовых видео нет — готовлю, это может занять время…")
         await scheduler.prepare_all(context.application, extra=extra, telegram_id=uid)
     await scheduler.deliver_plan(context.bot, uid)
+
+
+async def cmd_resetquota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resetquota — обнулить дневную норму ближайшего дня выдачи (на время тестов).
+
+    Ручные /plan засчитываются в норму завтрашней выдачи; после сброса утренняя подготовка (08:00) и
+    /plan снова берут полную норму. Выданные видео повторно не придут."""
+    uid = update.effective_user.id
+    day, freed = scheduler.reset_quota(uid)
+    report = scheduler.quota_report(uid)
+    await update.message.reply_text(
+        f"♻️ Норма на {day} обнулена (освобождено записей: {freed}).\n"
+        f"Утренняя подготовка и /plan снова возьмут полную норму; уже выданные видео не повторятся.\n\n{report}"
+        if freed else
+        f"Норма на {day} и так пуста: сбрасывать нечего.\n\n{report}")
 
 
 async def cmd_nolimit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -847,6 +863,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("nolimit", cmd_nolimit))
+    app.add_handler(CommandHandler("resetquota", cmd_resetquota))
     app.add_handler(CommandHandler("testplan", cmd_testplan))
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("templates", show_templates))

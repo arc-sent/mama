@@ -395,6 +395,19 @@ def count_queue_for_day(rule_id: int, plan_day: str) -> int:
     return row["c"] if row else 0
 
 
+def reset_queue_day(telegram_id: int, plan_day: str) -> int:
+    """Обнулить норму дня: строки очереди этого дня перестают в неё засчитываться.
+
+    Не удаляются и не повторяются: видео остаются в журнале выдачи (``delivered``), поэтому в новую
+    порцию они не попадут, а лишь освобождают место в дневной норме. Возвращает число строк."""
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE queue SET plan_day = plan_day || '+reset' WHERE telegram_id = ? AND plan_day = ?",
+            (telegram_id, plan_day),
+        )
+        return cur.rowcount
+
+
 def add_queue_item(
     *, telegram_id: int, rule_id: int, tt_video_id: str, url: str,
     title: str | None, plan_day: str, video_description: str | None = None,
