@@ -1,4 +1,4 @@
-"""Telegram-интерфейс mother: группы, источники, правила, план.
+"""Telegram-интерфейс mother: аккаунты, группы, источники, правила, план.
 
 Бот ничего не публикует и не знает про VK API: он готовит видео и раз в день
 (в DELIVER_HOUR:DELIVER_MINUTE МСК) присылает JSON-план файлом.
@@ -24,6 +24,7 @@ from telegram.ext import (  # noqa: E402
 )
 
 import account_source  # noqa: E402
+import accounts  # noqa: E402
 import config  # noqa: E402
 import db  # noqa: E402
 import scheduler  # noqa: E402
@@ -41,13 +42,15 @@ logger = logging.getLogger("mother")
 BTN_GROUPS, BTN_SOURCES, BTN_RULES = "👥 Группы", "🎬 Источники", "📋 Правила"
 BTN_STATUS, BTN_PLAN = "📊 Статус", "📦 План сейчас"
 BTN_TEMPLATES = "📝 Описания"
-MENU_TEXTS = {BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS, BTN_PLAN, BTN_TEMPLATES}
+BTN_ACCOUNTS = "🧑‍💻 Аккаунты"
+MENU_TEXTS = {BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS, BTN_PLAN, BTN_TEMPLATES}
 MENU = ReplyKeyboardMarkup(
-    [[BTN_GROUPS, BTN_SOURCES, BTN_RULES], [BTN_STATUS, BTN_PLAN], [BTN_TEMPLATES]], resize_keyboard=True
+    [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES], [BTN_STATUS, BTN_PLAN, BTN_TEMPLATES]],
+    resize_keyboard=True,
 )
 
 (G_LINK, G_CONFIRM, G_NAME, G_RENAME, T_TITLE, T_BODY, S_NICK, S_PATH, S_USER,
- R_SRC, R_GRP, R_N, R_EDIT_VALUE, R_DESC_PICK) = range(14)
+ R_SRC, R_GRP, R_N, R_EDIT_VALUE, R_DESC_PICK, A_LINK, A_CONFIRM, A_NAME, A_PROFILE, A_RENAME) = range(19)
 
 
 def _kb(rows):
@@ -98,8 +101,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 mother готовит видео и в "
         f"{config.DELIVER_HOUR:02d}:{config.DELIVER_MINUTE:02d} МСК присылает JSON-план.\n\n"
-        "1) 👥 добавь группы (числовой id)\n2) 🎬 добавь источники\n"
-        "3) 📋 свяжи их правилами\n\n/plan — получить план прямо сейчас.\n"
+        "1) 🧑‍💻 добавь аккаунты (страница VK + профиль ManyFaces)\n"
+        "2) 👥 добавь группы и привяжи их к аккаунтам\n3) 🎬 добавь источники\n"
+        "4) 📋 свяжи их правилами\n\n/plan — получить план прямо сейчас.\n"
         "/nolimit 20 — выдать 20 видео без дневной нормы.\n"
         "/resetquota — обнулить норму ближайшего дня (на время тестов).",
         reply_markup=MENU,
@@ -114,7 +118,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     state = "⏸ на паузе" if scheduler.is_paused() else "▶️ работает"
     await update.message.reply_text(
         f"{state}\n"
-        f"Групп: {len(db.get_groups(uid))}, источников: {len(db.get_sources(uid))}, "
+        f"Аккаунтов: {len(db.get_accounts(uid))}, групп: {len(db.get_groups(uid))}, "
+        f"источников: {len(db.get_sources(uid))}, "
         f"правил: {len(rules)} (включено {sum(1 for r in rules if r['enabled'])})\n"
         f"В очереди: готово {len(ready)}, скачивается {len(pending)}\n"
         f"Выдача: {config.DELIVER_HOUR:02d}:{config.DELIVER_MINUTE:02d} МСК, "
@@ -285,8 +290,10 @@ def groups_kb(telegram_id: int) -> InlineKeyboardMarkup:
     for g in db.get_groups(telegram_id):
         rows.append([InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
                                           callback_data="noop")])
-        rows.append([InlineKeyboardButton("✏️ Переименовать", callback_data=f"g_ren:{g['id']}"),
-                     InlineKeyboardButton("🗑 Удалить", callback_data=f"g_del:{g['id']}")])
+        rows.append([InlineKeyboardButton(f"🧑‍💻 {g['account_name'] or 'без аккаунта'}",
+                                          callback_data=f"g_acc:{g['id']}"),
+                     InlineKeyboardButton("✏️", callback_data=f"g_ren:{g['id']}"),
+                     InlineKeyboardButton("🗑", callback_data=f"g_del:{g['id']}")])
     rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="g_add")])
     return InlineKeyboardMarkup(rows)
 
@@ -327,8 +334,8 @@ async def g_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await q.answer()
     uid = update.effective_user.id
     if q.data == "g_ok":
-        db.add_group(uid, context.user_data.pop("g_vk_id"), context.user_data.pop("g_name"))
-        await q.edit_message_text("✅ Группа добавлена.\n\nТвои группы:", reply_markup=groups_kb(uid))
+        gid = db.add_group(uid, context.user_data.pop("g_vk_id"), context.user_data.pop("g_name"))
+        await _group_added(update, uid, gid)
         return ConversationHandler.END
     await q.edit_message_text("Введи название группы вручную:")
     return G_NAME
@@ -336,10 +343,209 @@ async def g_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def g_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
-    db.add_group(uid, context.user_data.pop("g_vk_id"), update.message.text.strip()[:100])
+    gid = db.add_group(uid, context.user_data.pop("g_vk_id"), update.message.text.strip()[:100])
     context.user_data.pop("g_name", None)
-    await update.message.reply_text("✅ Группа добавлена.\n\nТвои группы:", reply_markup=groups_kb(uid))
+    await _group_added(update, uid, gid)
     return ConversationHandler.END
+
+
+async def _group_added(update: Update, uid: int, gid: int) -> None:
+    """Группа сохранена: если аккаунты есть — сразу спросить, к какому её привязать."""
+    if db.get_accounts(uid):
+        await _show(update, "✅ Группа добавлена. С какого аккаунта в неё выкладывать?",
+                    account_picker_kb(uid, gid))
+    else:
+        await _show(update, "✅ Группа добавлена. Аккаунтов пока нет: выкладка пойдёт профилем по "
+                            "умолчанию на ПК. Добавить аккаунт — 🧑‍💻 Аккаунты.\n\nТвои группы:",
+                    groups_kb(uid))
+
+
+def account_picker_kb(uid: int, gid: int) -> InlineKeyboardMarkup:
+    rows = [[(f"🧑‍💻 {a['name']} (vk id {a['vk_user_id']})", f"g_setacc:{gid}:{a['id']}")]
+            for a in db.get_accounts(uid)]
+    rows.append([("— без аккаунта (профиль по умолчанию)", f"g_setacc:{gid}:0")])
+    return _kb(rows)
+
+
+async def g_acc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    gid = int(update.callback_query.data.split(":")[1])
+    g = db.get_group(gid)
+    uid = update.effective_user.id
+    if not g or g["telegram_id"] != uid:
+        await update.callback_query.answer("Группа не найдена")
+        return
+    await update.callback_query.answer()
+    if not db.get_accounts(uid):
+        await _show(update, "Аккаунтов пока нет. Добавь их в разделе 🧑‍💻 Аккаунты.", groups_kb(uid))
+        return
+    await _show(update, f"Группа «{g['name']}»: с какого аккаунта в неё выкладывать?", account_picker_kb(uid, gid))
+
+
+async def g_setacc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, gid, aid = update.callback_query.data.split(":")
+    gid, aid = int(gid), int(aid)
+    uid = update.effective_user.id
+    g = db.get_group(gid)
+    a = db.get_account(aid) if aid else None
+    if not g or g["telegram_id"] != uid or (aid and (not a or a["telegram_id"] != uid)):
+        await update.callback_query.answer("Не найдено")
+        return
+    db.set_group_account(gid, a["id"] if a else None)
+    await update.callback_query.answer("Сохранено")
+    who = f"аккаунт «{a['name']}»" if a else "без аккаунта"
+    await _show(update, f"✅ «{g['name']}»: {who}.\n\nТвои группы:", groups_kb(uid))
+
+
+# ─── Аккаунты (страница VK + профиль ManyFaces) ───────────────────────────────
+
+def accounts_kb(telegram_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for a in db.get_accounts(telegram_id):
+        rows.append([InlineKeyboardButton(f"{accounts.account_line(a)} · групп {a['n_groups']}",
+                                          callback_data="noop")])
+        rows.append([InlineKeyboardButton("🖥 Профиль", callback_data=f"a_chp:{a['id']}"),
+                     InlineKeyboardButton("✏️", callback_data=f"a_ren:{a['id']}"),
+                     InlineKeyboardButton("🗑", callback_data=f"a_del:{a['id']}")])
+    rows.append([InlineKeyboardButton("➕ Добавить аккаунт", callback_data="a_add")])
+    rows.append([InlineKeyboardButton("🖥 Профили на ПК", callback_data="a_pc")])
+    return InlineKeyboardMarkup(rows)
+
+
+def profile_kb(prefix: str) -> InlineKeyboardMarkup:
+    """Выбор профиля ManyFaces из списка, который прислал ПК. callback: <prefix><id профиля | ->."""
+    return _kb([[(text, f"{prefix}{value}")] for text, value in accounts.profile_choices()])
+
+
+ACCOUNTS_HELP = ("Аккаунт — страница VK и профиль ManyFaces на ПК, в котором выполнен вход в неё. Группы "
+                 "аккаунта выкладываются из этого профиля, группы без аккаунта — профилем по умолчанию.")
+ACCOUNT_ADDED = "✅ Аккаунт добавлен. Привяжи к нему группы в 👥 Группы (кнопка 🧑‍💻).\n\nТвои аккаунты:"
+
+
+async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show(update, f"{ACCOUNTS_HELP}\n\nТвои аккаунты:", accounts_kb(update.effective_user.id))
+
+
+async def a_pc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text(
+        f"{accounts.known_profiles_text()}\n\n{accounts.HOW_TO_SYNC}")
+
+
+async def a_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _show(update,
+                "Пришли ссылку на страницу VK:\n• vk.com/id123456\n• vk.com/my_name\n"
+                "(можно и просто числовой id)")
+    return A_LINK
+
+
+async def a_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    loop = asyncio.get_running_loop()
+    vk_id, name, error = await loop.run_in_executor(None, vk_link.resolve_user, update.message.text)
+    logger.info("Аккаунт по ссылке %r -> id=%s name=%s error=%s", update.message.text, vk_id, name, bool(error))
+    if error:
+        await update.message.reply_text(error + "\n\nПопробуй ещё раз или /cancel.")
+        return A_LINK
+    context.user_data["a_vk_id"] = vk_id
+    if name:
+        context.user_data["a_name"] = name
+        await update.message.reply_text(
+            f"Нашёл: «{name}» (id {vk_id}). Сохранить?",
+            reply_markup=_kb([[("✅ Сохранить", "a_ok")], [("✏️ Задать своё имя", "a_own")]]),
+        )
+        return A_CONFIRM
+    await update.message.reply_text(f"Страница найдена (id {vk_id}). Введи название вручную:")
+    return A_NAME
+
+
+async def a_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    if q.data == "a_ok":
+        await _ask_profile(update, context)
+        return A_PROFILE
+    await q.edit_message_text("Введи название аккаунта:")
+    return A_NAME
+
+
+async def a_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["a_name"] = update.message.text.strip()[:100]
+    await _ask_profile(update, context)
+    return A_PROFILE
+
+
+async def _ask_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show(update,
+                f"В каком профиле ManyFaces выполнен вход в «{context.user_data['a_name']}»?\n\n"
+                f"{accounts.synced_text()}\n{accounts.HOW_TO_SYNC}",
+                profile_kb("a_prof:"))
+
+
+async def a_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    ok, pid, pname = accounts.pick_profile(q.data.split(":", 1)[1])
+    if not ok:
+        await q.answer("Этого профиля уже нет в списке с ПК")
+        await _ask_profile(update, context)
+        return A_PROFILE
+    await q.answer()
+    uid = update.effective_user.id
+    db.add_account(uid, context.user_data.pop("a_vk_id"), context.user_data.pop("a_name"), pid, pname)
+    await _show(update, ACCOUNT_ADDED, accounts_kb(uid))
+    return ConversationHandler.END
+
+
+async def a_chp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    aid = int(update.callback_query.data.split(":")[1])
+    a = db.get_account(aid)
+    if not a or a["telegram_id"] != update.effective_user.id:
+        await update.callback_query.answer("Аккаунт не найден")
+        return
+    await update.callback_query.answer()
+    await _show(update, f"«{a['name']}»: в каком профиле ManyFaces выполнен вход?\n\n{accounts.synced_text()}",
+                profile_kb(f"a_setp:{aid}:"))
+
+
+async def a_setp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _, aid, value = update.callback_query.data.split(":", 2)
+    a = db.get_account(int(aid))
+    uid = update.effective_user.id
+    if not a or a["telegram_id"] != uid:
+        await update.callback_query.answer("Аккаунт не найден")
+        return
+    ok, pid, pname = accounts.pick_profile(value)
+    if not ok:
+        await update.callback_query.answer("Этого профиля уже нет в списке с ПК")
+        return
+    db.set_account_profile(a["id"], pid, pname)
+    await update.callback_query.answer("Сохранено")
+    await _show(update, "✅ Профиль сохранён.\n\nТвои аккаунты:", accounts_kb(uid))
+
+
+async def a_ren(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    aid = int(update.callback_query.data.split(":")[1])
+    a = db.get_account(aid)
+    if not a or a["telegram_id"] != update.effective_user.id:
+        await update.callback_query.answer("Аккаунт не найден")
+        return ConversationHandler.END
+    context.user_data["a_rename"] = aid
+    await _show(update, "Введи новое название аккаунта:")
+    return A_RENAME
+
+
+async def a_rename_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    db.rename_account(context.user_data.pop("a_rename"), update.message.text.strip()[:100])
+    await update.message.reply_text("✅ Переименовано.\n\nТвои аккаунты:", reply_markup=accounts_kb(uid))
+    return ConversationHandler.END
+
+
+async def a_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    aid = int(update.callback_query.data.split(":")[1])
+    a = db.get_account(aid)
+    if a and a["telegram_id"] == update.effective_user.id:
+        db.delete_account(aid)
+    await update.callback_query.answer("Удалено: его группы остались, но без аккаунта")
+    await show_accounts(update, context)
 
 
 async def g_ren(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -791,7 +997,7 @@ async def r_edit_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 # ─── Меню ─────────────────────────────────────────────────────────────────────
 
 MENU_ROUTES = {
-    BTN_GROUPS: show_groups, BTN_SOURCES: show_sources, BTN_RULES: show_rules,
+    BTN_ACCOUNTS: show_accounts, BTN_GROUPS: show_groups, BTN_SOURCES: show_sources, BTN_RULES: show_rules,
     BTN_STATUS: cmd_status, BTN_PLAN: cmd_plan, BTN_TEMPLATES: show_templates,
 }
 
@@ -829,6 +1035,8 @@ def build_app() -> Application:
 
     conv = ConversationHandler(
         entry_points=[
+            CallbackQueryHandler(a_add, pattern=r"^a_add$"),
+            CallbackQueryHandler(a_ren, pattern=r"^a_ren:\d+$"),
             CallbackQueryHandler(g_add, pattern=r"^g_add$"),
             CallbackQueryHandler(g_ren, pattern=r"^g_ren:\d+$"),
             CallbackQueryHandler(t_add, pattern=r"^t_add$"),
@@ -839,6 +1047,11 @@ def build_app() -> Application:
             CallbackQueryHandler(r_edit_start, pattern=r"^re:(nday|desc|dur):\d+$"),
         ],
         states={
+            A_LINK: [MessageHandler(plain, a_link)],
+            A_CONFIRM: [CallbackQueryHandler(a_confirm, pattern=r"^a_(ok|own)$")],
+            A_NAME: [MessageHandler(plain, a_name)],
+            A_PROFILE: [CallbackQueryHandler(a_profile, pattern=r"^a_prof:.+$")],
+            A_RENAME: [MessageHandler(plain, a_rename_save)],
             G_LINK: [MessageHandler(plain, g_link)],
             G_CONFIRM: [CallbackQueryHandler(g_confirm, pattern=r"^g_(ok|own)$")],
             G_NAME: [MessageHandler(plain, g_name)],
@@ -871,6 +1084,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("startBot", cmd_start_bot))
     app.add_handler(CommandHandler("process", cmd_process))
     app.add_handler(CallbackQueryHandler(g_del, pattern=r"^g_del:\d+$"))
+    app.add_handler(CallbackQueryHandler(g_acc, pattern=r"^g_acc:\d+$"))
+    app.add_handler(CallbackQueryHandler(g_setacc, pattern=r"^g_setacc:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(a_del, pattern=r"^a_del:\d+$"))
+    app.add_handler(CallbackQueryHandler(a_pc, pattern=r"^a_pc$"))
+    app.add_handler(CallbackQueryHandler(a_chp, pattern=r"^a_chp:\d+$"))
+    app.add_handler(CallbackQueryHandler(a_setp, pattern=r"^a_setp:\d+:.+$"))
+    app.add_handler(CommandHandler("accounts", show_accounts))
     app.add_handler(CallbackQueryHandler(t_del, pattern=r"^t_del:\d+$"))
     app.add_handler(CallbackQueryHandler(s_del, pattern=r"^s_del:\d+$"))
     app.add_handler(CallbackQueryHandler(s_ref, pattern=r"^s_ref:\d+$"))

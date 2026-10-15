@@ -7,6 +7,9 @@
      "groups": [{"id": 7, "name": "Группа", "videos": [
          {"id": 5, "status": "ok", "site_video_id": 10088}, {"id": 6, "status": "failed", "error": "…"}]}],
      "missing": [{"id": 8, "reason": "не скачалось"}]}
+
+У группы может быть ``account`` ({"id": профиль ManyFaces, "name": ...}) — тогда в строке видно, с
+какого аккаунта шла выкладка.
 """
 
 
@@ -31,10 +34,18 @@ def format_result(plan_id: int, result: dict) -> str:
 
     for g, v in ok:
         site = f", id на сайте {v['site_video_id']}" if v.get("site_video_id") else ""
-        lines.append(f"✅ {g.get('name') or g.get('id')}: видео {v.get('id')}{site}")
+        lines.append(f"✅ {_where(g)}: видео {v.get('id')}{site}")
     for g, v in bad:
-        lines.append(f"❌ {g.get('name') or g.get('id')}: видео {v.get('id')} — {str(v.get('error') or 'не вышло')[:160]}")
+        lines.append(f"❌ {_where(g)}: видео {v.get('id')} — {str(v.get('error') or 'не вышло')[:160]}")
     for m in missing:
         lines.append(f"⚠️ Не скачалось на ПК: видео {m.get('id')} — {str(m.get('reason') or '')[:120]}")
 
     return "\n".join(lines)
+
+
+def _where(group: dict) -> str:
+    """«Аккаунт › Группа» или просто «Группа»."""
+    name = group.get("name") or group.get("id")
+    acc = group.get("account") if isinstance(group.get("account"), dict) else {}
+    acc_name = acc.get("name") or acc.get("id")
+    return f"{acc_name} › {name}" if acc_name else str(name)

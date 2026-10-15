@@ -3,7 +3,10 @@
 Модель данных (связь источник↔группа — многие-ко-многим через «правила»):
 
     users         — телеграм-пользователь
-    groups        — целевые группы (числовой id группы вводится вручную, к VK не обращаемся)
+    accounts      — аккаунты: страница VK (id пользователя) + профиль ManyFaces на ПК, вошедший в неё
+    pc_profiles   — профили ManyFaces, о которых сообщил ПК (из них выбирают профиль аккаунта)
+    groups        — целевые группы (числовой id группы вводится вручную, к VK не обращаемся);
+                    группа может быть привязана к аккаунту (account_id)
     sources       — источники видео (база парсера или аккаунт TikTok)
     rules         — правило = пара (источник → группа) + настройки выдачи
     delivered     — что уже выдано по каждому правилу (дедуп)
@@ -47,6 +50,23 @@ def init_db() -> None:
                 name        TEXT NOT NULL,
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
                 UNIQUE (telegram_id, vk_group_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS accounts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id  INTEGER NOT NULL,
+                vk_user_id   INTEGER NOT NULL,                  -- страница VK: vk.com/id<vk_user_id>
+                name         TEXT NOT NULL,
+                profile_id   TEXT,                              -- профиль ManyFaces на ПК; NULL — по умолчанию
+                profile_name TEXT,
+                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
+                UNIQUE (telegram_id, vk_user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS pc_profiles (
+                profile_id  TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                seen_at     INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS sources (
@@ -161,6 +181,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE plans ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
             # итоги, пришедшие до появления уведомлений, повторно не присылаем
             conn.execute("UPDATE plans SET notified = 1 WHERE result IS NOT NULL")
+        group_cols = {row[1] for row in conn.execute("PRAGMA table_info(groups)")}
+        if "account_id" not in group_cols:
+            # удалили аккаунт — группа остаётся, просто без аккаунта
+            conn.execute("ALTER TABLE groups ADD COLUMN account_id INTEGER "
+                         "REFERENCES accounts(id) ON DELETE SET NULL")
         queue_cols = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
         if "video_description" not in queue_cols:
             conn.execute("ALTER TABLE queue ADD COLUMN video_description TEXT")
@@ -178,12 +203,99 @@ def get_user_ids() -> list[int]:
         return [r["telegram_id"] for r in conn.execute("SELECT telegram_id FROM users")]
 
 
+# ─── Аккаунты (страница VK + профиль ManyFaces) ───────────────────────────────
+
+def get_accounts(telegram_id: int) -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT a.*, (SELECT COUNT(*) FROM groups g WHERE g.account_id = a.id) AS n_groups "
+            "FROM accounts a WHERE a.telegram_id = ? ORDER BY a.id", (telegram_id,)
+        ).fetchall()
+
+
+def get_account(account_id: int) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+
+
+def add_account(telegram_id: int, vk_user_id: int, name: str,
+                profile_id: str | None = None, profile_name: str | None = None) -> int:
+    """Добавить аккаунт (та же страница VK второй раз — обновит название и профиль). Возвращает id строки."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO accounts (telegram_id, vk_user_id, name, profile_id, profile_name) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id, vk_user_id) DO UPDATE SET
+                name = excluded.name, profile_id = excluded.profile_id, profile_name = excluded.profile_name
+            """,
+            (telegram_id, vk_user_id, name, profile_id, profile_name),
+        )
+        return conn.execute("SELECT id FROM accounts WHERE telegram_id = ? AND vk_user_id = ?",
+                            (telegram_id, vk_user_id)).fetchone()["id"]
+
+
+def set_account_profile(account_id: int, profile_id: str | None, profile_name: str | None) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE accounts SET profile_id = ?, profile_name = ? WHERE id = ?",
+                     (profile_id, profile_name, account_id))
+
+
+def rename_account(account_id: int, name: str) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE accounts SET name = ? WHERE id = ?", (name, account_id))
+
+
+def delete_account(account_id: int) -> None:
+    """Группы аккаунта остаются, но без аккаунта."""
+    with _connect() as conn:
+        conn.execute("UPDATE groups SET account_id = NULL WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+
+def set_group_account(group_row_id: int, account_id: int | None) -> None:
+    with _connect() as conn:
+        conn.execute("UPDATE groups SET account_id = ? WHERE id = ?", (account_id, group_row_id))
+
+
+# ─── Профили, о которых сообщил ПК ────────────────────────────────────────────
+
+def set_pc_profiles(profiles: list[dict]) -> int:
+    """Заменить список профилей ManyFaces с ПК: [{"id": "...", "name": "..."}]. Возвращает их число."""
+    now = int(time.time())
+    rows = [(str(p["id"]).strip().lower(), str(p.get("name") or "")[:100], now) for p in profiles]
+    with _connect() as conn:
+        conn.execute("DELETE FROM pc_profiles")
+        conn.executemany("INSERT OR REPLACE INTO pc_profiles (profile_id, name, seen_at) VALUES (?, ?, ?)", rows)
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('pc_profiles_at', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(now),))
+    return len(rows)
+
+
+def get_pc_profiles() -> list[sqlite3.Row]:
+    with _connect() as conn:
+        return conn.execute("SELECT * FROM pc_profiles ORDER BY name").fetchall()
+
+
+def get_pc_profile(profile_id: str) -> sqlite3.Row | None:
+    with _connect() as conn:
+        return conn.execute("SELECT * FROM pc_profiles WHERE profile_id = ?",
+                            (profile_id.strip().lower(),)).fetchone()
+
+
+def pc_profiles_synced_at() -> int | None:
+    value = get_setting("pc_profiles_at")
+    return int(value) if value else None
+
+
 # ─── Группы ───────────────────────────────────────────────────────────────────
 
 def get_groups(telegram_id: int) -> list[sqlite3.Row]:
     with _connect() as conn:
         return conn.execute(
-            "SELECT * FROM groups WHERE telegram_id = ? ORDER BY id", (telegram_id,)
+            "SELECT g.*, a.name AS account_name, a.vk_user_id AS account_vk_id, a.profile_id AS profile_id "
+            "FROM groups g LEFT JOIN accounts a ON a.id = g.account_id "
+            "WHERE g.telegram_id = ? ORDER BY g.id", (telegram_id,)
         ).fetchall()
 
 
@@ -192,7 +304,8 @@ def get_group(group_row_id: int) -> sqlite3.Row | None:
         return conn.execute("SELECT * FROM groups WHERE id = ?", (group_row_id,)).fetchone()
 
 
-def add_group(telegram_id: int, vk_group_id: int, name: str) -> None:
+def add_group(telegram_id: int, vk_group_id: int, name: str) -> int:
+    """Добавить группу (та же группа второй раз — только обновит название). Возвращает id строки."""
     with _connect() as conn:
         conn.execute(
             """
@@ -201,6 +314,8 @@ def add_group(telegram_id: int, vk_group_id: int, name: str) -> None:
             """,
             (telegram_id, vk_group_id, name),
         )
+        return conn.execute("SELECT id FROM groups WHERE telegram_id = ? AND vk_group_id = ?",
+                            (telegram_id, vk_group_id)).fetchone()["id"]
 
 
 def rename_group(group_row_id: int, name: str) -> None:
@@ -429,8 +544,10 @@ def add_queue_item(
 def get_queue(status: str | None = None, telegram_id: int | None = None) -> list[sqlite3.Row]:
     sql = (
         "SELECT q.*, g.vk_group_id AS vk_group_id, g.name AS group_name, "
-        "r.description AS rule_description "
+        "r.description AS rule_description, a.vk_user_id AS account_vk_id, a.name AS account_name, "
+        "a.profile_id AS profile_id, a.profile_name AS profile_name "
         "FROM queue q JOIN rules r ON r.id = q.rule_id JOIN groups g ON g.id = r.group_id "
+        "LEFT JOIN accounts a ON a.id = g.account_id "
         "WHERE 1=1"
     )
     params: list = []

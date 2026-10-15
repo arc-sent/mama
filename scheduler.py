@@ -24,7 +24,7 @@ from config import MOSCOW_TZ
 from downloader import (
     detect_platform, download_tiktok, download_likee, download_youtube,
 )
-from plan_builder import build_plan
+from plan_builder import build_plan, plan_groups
 
 logger = logging.getLogger(__name__)
 
@@ -420,11 +420,13 @@ async def deliver_plan(bot, telegram_id: int, *, notify_empty: bool = True) -> b
     with open(plan_file, "w", encoding="utf-8") as f:
         f.write(text)
 
-    n_videos = sum(len(g["videos"]) for g in plan["groups"])
+    groups = plan_groups(plan)
+    n_videos = sum(len(g["videos"]) for g in groups)
     with open(plan_file, "rb") as f:
         await bot.send_document(
             telegram_id, document=f, filename=f"plan_{plan_id}.json",
-            caption=f"📦 План #{plan_id}: групп {len(plan['groups'])}, видео {n_videos}",
+            caption=f"📦 План #{plan_id}: аккаунтов {len(plan['accounts'])}, групп {len(groups)}, "
+                    f"видео {n_videos}",
         )
 
     # Только после успешной отправки: сохраняем план и помечаем видео выданными. В базе лежит

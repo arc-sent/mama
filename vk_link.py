@@ -124,3 +124,61 @@ def resolve_group(text: str) -> tuple[int | None, str | None, str | None]:
         "Не смог определить сообщество по этой ссылке. Пришли ссылку вида "
         "vk.com/club123 или просто числовой id."
     )
+
+
+# ─── Страница пользователя (аккаунт) ──────────────────────────────────────────
+
+_USER_ID_RE = re.compile(r"^id(\d+)$", re.IGNORECASE)
+_GROUP_RE = re.compile(r"^(?:club|public|event)\d+$", re.IGNORECASE)
+
+
+def _fetch_html(name: str) -> str | None:
+    try:
+        resp = requests.get(
+            f"https://vk.com/{name}", headers={"User-Agent": _UA},
+            timeout=20, proxies=_lookup_proxies(), allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        logger.warning("VK-страница %r: сеть: %r", name, e)
+        return None
+    if resp.status_code != 200:
+        logger.warning("VK-страница %r: HTTP %s (%s)", name, resp.status_code, resp.url)
+        return None
+    return resp.content.decode("cp1251", errors="replace")
+
+
+def embedded_user(html: str) -> dict | None:
+    """Страница пользователя несёт в себе ответ users.get — берём оттуда id, имя, фамилию."""
+    i = html.find('"method":"users.get"')
+    if i < 0:
+        return None
+    j = html.find('"response":', i)
+    if j < 0:
+        return None
+    try:
+        users, _ = json.JSONDecoder().raw_decode(html[j + len('"response":'):])
+    except ValueError:
+        return None
+    if isinstance(users, list) and users and isinstance(users[0], dict) and users[0].get("id"):
+        return users[0]
+    return None
+
+
+def resolve_user(text: str) -> tuple[int | None, str | None, str | None]:
+    """(id, «Имя Фамилия», ошибка) по ссылке на страницу VK: vk.com/id123, vk.com/имя, id123, 123."""
+    raw = extract_screen_name(text)
+    if not raw:
+        return None, None, "Пустая ссылка. Пришли ссылку на страницу VK."
+    if _GROUP_RE.match(raw) or re.match(r"(?:video|wall|clip|photo)-\d+", raw, re.IGNORECASE):
+        return None, None, "Это ссылка на сообщество, а нужна страница пользователя: vk.com/id123 или vk.com/имя."
+    m = _USER_ID_RE.match(raw)
+    page = f"id{m.group(1)}" if m else (f"id{raw}" if raw.isdigit() else raw)
+    html = _fetch_html(page)
+    user = embedded_user(html) if html else None
+    if not user:
+        return None, None, ("Не нашёл страницу пользователя VK по этой ссылке. Пришли ссылку вида "
+                            "vk.com/id123 или vk.com/имя (на сообщество не подойдёт).")
+    if user.get("deactivated"):
+        return None, None, f"Страница id{user['id']} удалена или заблокирована во VK."
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x).strip()[:100]
+    return int(user["id"]), name or None, None

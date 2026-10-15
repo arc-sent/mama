@@ -5,6 +5,9 @@
     GET  /plan/<id>            — конкретный план
     GET  /video/<video12.mp4>  — файл видео (поддерживает Range: докачка после обрыва)
     POST /plan/<id>/result     — ответ ПК: что выложено, а что нет (JSON)
+    GET  /profiles             — профили ManyFaces, о которых ПК сообщил последним
+    POST /profiles             — ПК сообщает свои профили: {"profiles": [{"id": "...", "name": "..."}]};
+                                 по этому списку бот проверяет id профиля, когда добавляют аккаунт
 
 Всё, кроме /health, требует заголовок ``Authorization: Bearer <MOTHER_API_TOKEN>``.
 Сам по себе сервер не шифрует трафик: наружу его выставляют только за HTTPS-прокси
@@ -28,6 +31,8 @@ MAX_BODY = 1024 * 1024
 PLAN_RE = re.compile(r"^/plan/(\d+)$")
 RESULT_RE = re.compile(r"^/plan/(\d+)/result$")
 VIDEO_RE = re.compile(r"^/video/([^/]+)$")
+PROFILE_ID_RE = re.compile(r"^[0-9a-zA-Z_-]{1,64}$")
+MAX_PROFILES = 1000
 
 
 def make_handler(token: str, video_dir: str):
@@ -66,6 +71,9 @@ def make_handler(token: str, video_dir: str):
             m = VIDEO_RE.match(path)
             if m:
                 return self._video(m.group(1))
+            if path == "/profiles":
+                return self._json(200, {"synced_at": db.pc_profiles_synced_at(), "profiles": [
+                    {"id": r["profile_id"], "name": r["name"]} for r in db.get_pc_profiles()]})
             self._json(404, {"error": "not found"})
 
         def _plan(self, row, missing: str) -> None:
@@ -107,8 +115,9 @@ def make_handler(token: str, video_dir: str):
         def do_POST(self):
             if not self._authorized():
                 return self._json(401, {"error": "unauthorized"})
-            m = RESULT_RE.match(self.path.split("?", 1)[0])
-            if not m:
+            path = self.path.split("?", 1)[0]
+            m = RESULT_RE.match(path)
+            if not m and path != "/profiles":
                 return self._json(404, {"error": "not found"})
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0 or length > MAX_BODY:
@@ -119,10 +128,23 @@ def make_handler(token: str, video_dir: str):
                 return self._json(400, {"error": "тело не JSON"})
             if not isinstance(result, dict):
                 return self._json(400, {"error": "ожидается JSON-объект"})
+            if not m:
+                return self._profiles(result)
             if not db.set_plan_result(int(m.group(1)), result):
                 return self._json(404, {"error": "нет такого плана"})
             logger.info("api: получен результат плана %s", m.group(1))
             self._json(200, {"ok": True})
+
+        def _profiles(self, body: dict) -> None:
+            profiles = body.get("profiles")
+            if not isinstance(profiles, list) or len(profiles) > MAX_PROFILES:
+                return self._json(400, {"error": f"нужен список profiles (до {MAX_PROFILES})"})
+            for p in profiles:
+                if not isinstance(p, dict) or not PROFILE_ID_RE.match(str(p.get("id") or "")):
+                    return self._json(400, {"error": "у каждого профиля нужен id (буквы, цифры, _ и -)"})
+            n = db.set_pc_profiles(profiles)
+            logger.info("api: ПК сообщил профили ManyFaces: %s", n)
+            self._json(200, {"ok": True, "profiles": n})
 
     return Handler
 

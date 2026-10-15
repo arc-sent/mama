@@ -92,8 +92,10 @@ def test_deliver_plan_sends_json_and_marks_delivered(user_group_source, tmp_path
     assert asyncio.run(scheduler.deliver_plan(bot, uid)) is True
     chat, name, body = bot.documents[0]
     assert chat == uid and name == "plan_1.json" and body["id"] == 1
-    assert body["groups"][0]["id"] == 2343
-    assert [v["path"] for v in body["groups"][0]["videos"]] == [
+    assert body["accounts"][0]["id"] is None                        # группа без аккаунта
+    group = body["accounts"][0]["groups"][0]
+    assert group["id"] == 2343
+    assert [v["path"] for v in group["videos"]] == [
         f"{config.OUTPUT_PATH_PREFIX}/video1.mp4", f"{config.OUTPUT_PATH_PREFIX}/video2.mp4"]
     assert db.get_queue("ready") == []
     assert db.get_delivered_ids(rule["id"]) == {"v1", "v2"}
