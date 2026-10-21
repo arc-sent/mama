@@ -136,7 +136,8 @@ def init_db() -> None:
                 result      TEXT,                               -- ответ ПК: что выложено
                 acked_at    INTEGER,
                 cleaned     INTEGER NOT NULL DEFAULT 0,         -- файлы плана уже удалены
-                notified    INTEGER NOT NULL DEFAULT 0          -- об итоге выкладки уже написали в Telegram
+                notified    INTEGER NOT NULL DEFAULT 0,         -- об итоге выкладки уже написали в Telegram
+                retry_of    INTEGER                             -- повтор: id плана, видео которого не вышли
             );
 
             CREATE TABLE IF NOT EXISTS description_templates (
@@ -181,6 +182,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE plans ADD COLUMN notified INTEGER NOT NULL DEFAULT 0")
             # итоги, пришедшие до появления уведомлений, повторно не присылаем
             conn.execute("UPDATE plans SET notified = 1 WHERE result IS NOT NULL")
+        if "retry_of" not in plan_cols:
+            conn.execute("ALTER TABLE plans ADD COLUMN retry_of INTEGER")
         group_cols = {row[1] for row in conn.execute("PRAGMA table_info(groups)")}
         if "account_id" not in group_cols:
             # удалили аккаунт — группа остаётся, просто без аккаунта
@@ -599,9 +602,9 @@ def save_plan(telegram_id: int, plan_day: str, body: dict) -> None:
     """Сохранить выданный план; body['id'] становится id строки."""
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO plans (id, telegram_id, plan_day, created_at, body) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO plans (id, telegram_id, plan_day, created_at, body, retry_of) VALUES (?, ?, ?, ?, ?, ?)",
             (body["id"], telegram_id, plan_day, int(time.time()),
-             json.dumps(body, ensure_ascii=False)),
+             json.dumps(body, ensure_ascii=False), body.get("retry_of")),
         )
 
 
@@ -611,11 +614,35 @@ def get_plan(plan_id: int) -> sqlite3.Row | None:
 
 
 def get_pending_plan() -> sqlite3.Row | None:
-    """Самый свежий план, о котором ПК ещё не сообщил результат."""
+    """Самый свежий ежедневный план, о котором ПК ещё не сообщил результат (повторы — отдельно)."""
     with _connect() as conn:
         return conn.execute(
-            "SELECT * FROM plans WHERE result IS NULL AND cleaned = 0 ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM plans WHERE result IS NULL AND cleaned = 0 AND retry_of IS NULL "
+            "ORDER BY id DESC LIMIT 1"
         ).fetchone()
+
+
+def get_pending_retry() -> sqlite3.Row | None:
+    """Самый старый план-повтор, который ПК ещё не выложил."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM plans WHERE result IS NULL AND cleaned = 0 AND retry_of IS NOT NULL "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+
+
+def get_retry_for(plan_id: int) -> sqlite3.Row | None:
+    """Повтор, уже созданный для плана plan_id (если есть)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT * FROM plans WHERE retry_of = ? ORDER BY id DESC LIMIT 1", (plan_id,)
+        ).fetchone()
+
+
+def get_unfinished_plans() -> list[sqlite3.Row]:
+    """Планы, которые ПК ещё не выложил: их файлы удалять нельзя."""
+    with _connect() as conn:
+        return conn.execute("SELECT * FROM plans WHERE result IS NULL AND cleaned = 0").fetchall()
 
 
 def set_plan_result(plan_id: int, result: dict) -> bool:

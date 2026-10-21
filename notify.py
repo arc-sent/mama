@@ -13,7 +13,7 @@
 """
 
 
-def format_result(plan_id: int, result: dict) -> str:
+def format_result(plan_id: int, result: dict, retry_of: int | None = None) -> str:
     """Сводка для чата: сколько выложено, что не вышло и что не скачалось на ПК.
 
     Оценка детектора, ленты между видео и время завершения в сообщение намеренно не входят."""
@@ -30,7 +30,8 @@ def format_result(plan_id: int, result: dict) -> str:
         head = "⚠️"
     else:
         head = "❌"
-    lines = [f"{head} Выкладка плана №{plan_id} завершена", f"Выложено: {len(ok)} из {total}"]
+    what = f"плана №{plan_id}" + (f" (повтор плана №{retry_of})" if retry_of else "")
+    lines = [f"{head} Выкладка {what} завершена", f"Выложено: {len(ok)} из {total}"]
 
     for g, v in ok:
         site = f", id на сайте {v['site_video_id']}" if v.get("site_video_id") else ""

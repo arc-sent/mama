@@ -1010,6 +1010,19 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Необработанная ошибка", exc_info=context.error)
 
 
+async def retry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🔁 Перевыложить не вышедшие» под итогом выкладки."""
+    q = update.callback_query
+    await q.answer()
+    plan_id = int(q.data.split(":", 1)[1])
+    text = scheduler.create_retry(update.effective_user.id, plan_id)
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)    # кнопка нажата — убрать, чтобы не жать дважды
+    except Exception:
+        pass
+    await q.message.reply_text(text)
+
+
 def build_app() -> Application:
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
@@ -1098,6 +1111,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(r_detail, pattern=r"^rd:\d+$"))
     app.add_handler(CallbackQueryHandler(r_list, pattern=r"^r_list$"))
     app.add_handler(CallbackQueryHandler(r_action, pattern=r"^r[topx]:\d+$"))
+    app.add_handler(CallbackQueryHandler(retry_cb, pattern=r"^retry:\d+$"))
     app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern=r"^noop$"))
     app.add_handler(MessageHandler(menu_filter, menu_router))
     app.add_error_handler(on_error)

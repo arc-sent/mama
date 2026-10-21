@@ -40,10 +40,11 @@ class Bot:
     def __init__(self, fail=False):
         self.sent, self.fail = [], fail
 
-    async def send_message(self, chat_id, text):
+    async def send_message(self, chat_id, text, reply_markup=None):
         if self.fail:
             raise RuntimeError("telegram недоступен")
         self.sent.append((chat_id, text))
+        self.markups = getattr(self, "markups", []) + [reply_markup]
 
 
 def _plan_with_result(user=1001, plan_id=3):

@@ -18,6 +18,7 @@ from datetime import datetime, time as dtime, timedelta
 import config
 import db
 import notify
+import retry
 import plan_files
 import video_processor
 from config import MOSCOW_TZ
@@ -484,8 +485,12 @@ def cleanup_acked(keep_days: int | None = None, now_ts: int | None = None) -> in
     keep_days = config.KEEP_DAYS if keep_days is None else keep_days
     cutoff = (now_ts if now_ts is not None else int(time.time())) - keep_days * 86400
     removed = 0
+    # файлы, которые ещё нужны невыложенному плану (например, повтору), не трогаем
+    in_use = {n for r in db.get_unfinished_plans() for n in plan_files.video_files(json.loads(r["body"]))}
     for row in db.get_plans_to_clean(cutoff):
         for name in plan_files.video_files(json.loads(row["body"])):
+            if name in in_use:
+                continue
             path = plan_files.safe_video_path(config.VIDEO_DIR, name)
             if path:
                 try:
@@ -511,13 +516,15 @@ async def notify_results(bot) -> int:
     sent = 0
     for row in db.get_unnotified_results():
         try:
-            text = notify.format_result(row["id"], json.loads(row["result"]))
+            result = json.loads(row["result"])
+            text = notify.format_result(row["id"], result, row["retry_of"])
+            markup = retry_markup(row["id"], result)
         except Exception:
             logger.exception("Итог плана %s не разобрать — помечаю как сообщённый", row["id"])
             db.mark_plan_notified(row["id"])
             continue
         try:
-            await bot.send_message(row["telegram_id"], text)
+            await bot.send_message(row["telegram_id"], text, reply_markup=markup)
         except Exception:
             logger.exception("Не удалось отправить итог плана %s, повторю позже", row["id"])
             continue
@@ -525,6 +532,58 @@ async def notify_results(bot) -> int:
         sent += 1
         logger.info("Итог плана %s отправлен пользователю %s", row["id"], row["telegram_id"])
     return sent
+
+
+def retry_markup(plan_id: int, result: dict):
+    """Кнопка «🔁 Перевыложить не вышедшие (N)», если повтор может что-то дать; иначе None."""
+    n = len(retry.retryable(result))
+    if not n:
+        return None
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🔁 Перевыложить не вышедшие ({n})",
+                                                       callback_data=f"retry:{plan_id}")]])
+
+
+def create_retry(telegram_id: int, plan_id: int) -> str:
+    """Создать план-повтор из не вышедших видео плана plan_id. Вернуть текст ответа для чата."""
+    row = db.get_plan(plan_id)
+    if row is None or row["telegram_id"] != telegram_id:
+        return "Такого плана нет."
+    if row["result"] is None:
+        return f"План №{plan_id} ещё не выложен — повторять нечего."
+    done = db.get_retry_for(plan_id)
+    if done is not None:
+        state = "уже выложен" if done["result"] is not None else "ждёт ПК"
+        return f"Повтор для плана №{plan_id} уже создан: план №{done['id']} ({state})."
+    keys = retry.retryable(json.loads(row["result"]))
+    if not keys:
+        return f"В плане №{plan_id} нет видео, которым поможет повтор."
+    plan = retry.build_retry_plan(json.loads(row["body"]), keys, db.next_plan_id(), plan_id)
+    # файлы должны быть ещё на сервере: ПК скачает их заново, если удалил у себя
+    gone = []
+    for g in plan_groups(plan):
+        kept = []
+        for v in g["videos"]:
+            if v.get("file") and plan_files.safe_video_path(config.VIDEO_DIR, v["file"]):
+                kept.append(v)
+            else:
+                gone.append(v.get("id"))
+        g["videos"] = kept
+    if isinstance(plan.get("accounts"), list):
+        for a in plan["accounts"]:
+            a["groups"] = [g for g in a["groups"] if g["videos"]]
+        plan["accounts"] = [a for a in plan["accounts"] if a["groups"]]
+    n = retry.count_videos(plan)
+    if not n:
+        return (f"Повторить нельзя: файлов этих видео на сервере уже нет (удаляются через {config.KEEP_DAYS} "
+                "дн. после выкладки).")
+    db.save_plan(telegram_id, datetime.now(MOSCOW_TZ).date().isoformat(), plan)
+    logger.info("План-повтор #%s из плана #%s: видео %s", plan["id"], plan_id, n)
+    text = (f"🔁 Создан план №{plan['id']} — повтор плана №{plan_id}: видео {n}. "
+            "ПК заберёт его в течение ~5 минут, если включён (иначе — при следующем включении).")
+    if gone:
+        text += f"\nБез файла на сервере, не повторяются: видео {', '.join(map(str, gone))}."
+    return text
 
 
 async def notify_job(context) -> None:

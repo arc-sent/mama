@@ -2,6 +2,7 @@
 
     GET  /health               — проверка (без токена)
     GET  /plan/latest          — самый свежий план без ответа ПК (404, если такого нет)
+    GET  /plan/retry           — план-повтор (видео, которые в прошлый раз не вышли), ждущий ПК (404 — нет)
     GET  /plan/<id>            — конкретный план
     GET  /video/<video12.mp4>  — файл видео (поддерживает Range: докачка после обрыва)
     POST /plan/<id>/result     — ответ ПК: что выложено, а что нет (JSON)
@@ -65,6 +66,8 @@ def make_handler(token: str, video_dir: str):
             if path == "/plan/latest":
                 row = db.get_pending_plan()
                 return self._plan(row, "нет плана, ожидающего выкладки")
+            if path == "/plan/retry":
+                return self._plan(db.get_pending_retry(), "нет повтора, ожидающего выкладки")
             m = PLAN_RE.match(path)
             if m:
                 return self._plan(db.get_plan(int(m.group(1))), "нет такого плана")
