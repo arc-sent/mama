@@ -79,6 +79,60 @@ async def _show(update: Update, text: str, markup=None) -> None:
         await update.message.reply_text(text, reply_markup=markup)
 
 
+# ─── Текущий аккаунт и страницы списков ───────────────────────────────────────
+# Как в omega: в боте выбран один аккаунт, и «Группы», «Источники», «Правила» показывают только его.
+# Группы без аккаунта — отдельный раздел «📂 Без аккаунта». Пока аккаунтов нет, показывается всё.
+# Длинные списки листаются стрелками ⬅️ ➡️: у Telegram есть предел числа кнопок в сообщении.
+
+PAGE_GROUPS, PAGE_SOURCES, PAGE_RULES, PAGE_PICK = 6, 6, 8, 8
+
+
+def current_scope(uid: int):
+    """None — аккаунтов нет (всё); 0 — «без аккаунта»; N — id выбранного аккаунта."""
+    accs = db.get_accounts(uid)
+    if not accs:
+        return None
+    cur = db.get_current_account(uid)
+    if cur == 0 or (cur and any(a["id"] == cur for a in accs)):
+        return cur
+    db.set_current_account(uid, accs[0]["id"])              # не выбран или удалён — первый по списку
+    return accs[0]["id"]
+
+
+def scope_name(scope) -> str:
+    if scope is None:
+        return ""
+    if scope == 0:
+        return "📂 Без аккаунта"
+    a = db.get_account(scope)
+    return f"🧑‍💻 {a['name']}" if a else ""
+
+
+def scope_head(uid: int, what: str) -> str:
+    """«Группы — 🧑‍💻 Алексей:» / «Группы:»."""
+    name = scope_name(current_scope(uid))
+    return f"{what} — {name}:" if name else f"{what}:"
+
+
+def _page(items: list, page: int, size: int):
+    pages = max(1, (len(items) + size - 1) // size)
+    page = max(0, min(page, pages - 1))
+    return items[page * size:(page + 1) * size], page, pages
+
+
+def _nav(prefix: str, page: int, pages: int) -> list:
+    """Ряд «⬅️ 2/5 ➡️» (пустой, если страница одна)."""
+    if pages <= 1:
+        return []
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}{page - 1}"))
+    row.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        row.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}{page + 1}"))
+    return row
+
+
 # ─── Доступ ───────────────────────────────────────────────────────────────────
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -102,7 +156,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 mother готовит видео и в "
         f"{config.DELIVER_HOUR:02d}:{config.DELIVER_MINUTE:02d} МСК присылает JSON-план.\n\n"
         "1) 🧑‍💻 добавь аккаунты (страница VK + профиль ManyFaces)\n"
-        "2) 👥 добавь группы и привяжи их к аккаунтам\n3) 🎬 добавь источники\n"
+        "2) выбери аккаунт (✅, «→ Перейти») и добавь в него 👥 группы\n3) 🎬 добавь источники\n"
         "4) 📋 свяжи их правилами\n\n/plan — получить план прямо сейчас.\n"
         "/nolimit 20 — выдать 20 видео без дневной нормы.\n"
         "/resetquota — обнулить норму ближайшего дня (на время тестов).",
@@ -285,21 +339,36 @@ async def menu_escape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 # ─── Группы ───────────────────────────────────────────────────────────────────
 
-def groups_kb(telegram_id: int) -> InlineKeyboardMarkup:
+def groups_kb(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
     rows = []
-    for g in db.get_groups(telegram_id):
+    items, page, pages = _page(db.get_groups(telegram_id, current_scope(telegram_id)), page, PAGE_GROUPS)
+    for g in items:
         rows.append([InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
                                           callback_data="noop")])
         rows.append([InlineKeyboardButton(f"🧑‍💻 {g['account_name'] or 'без аккаунта'}",
                                           callback_data=f"g_acc:{g['id']}"),
                      InlineKeyboardButton("✏️", callback_data=f"g_ren:{g['id']}"),
                      InlineKeyboardButton("🗑", callback_data=f"g_del:{g['id']}")])
+    nav = _nav("g_pg:", page, pages)
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="g_add")])
     return InlineKeyboardMarkup(rows)
 
 
+def groups_text(uid: int) -> str:
+    head = scope_head(uid, "Группы")
+    return head if db.get_groups(uid, current_scope(uid)) else head + "\nПока пусто."
+
+
 async def show_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _show(update, "Твои группы:", groups_kb(update.effective_user.id))
+    await _show(update, groups_text(update.effective_user.id), groups_kb(update.effective_user.id))
+
+
+async def g_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    uid = update.effective_user.id
+    await _show(update, groups_text(uid), groups_kb(uid, int(update.callback_query.data.split(":")[1])))
 
 
 async def g_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -350,7 +419,16 @@ async def g_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _group_added(update: Update, uid: int, gid: int) -> None:
-    """Группа сохранена: если аккаунты есть — сразу спросить, к какому её привязать."""
+    """Группа сохранена: она попадает в выбранный аккаунт (как в omega). В разделе «без аккаунта» — без
+    аккаунта; аккаунтов нет — профилем по умолчанию."""
+    scope = current_scope(uid)
+    if scope:
+        db.set_group_account(gid, scope)
+        await _show(update, f"✅ Группа добавлена в {scope_name(scope)}.\n\n{groups_text(uid)}", groups_kb(uid))
+        return
+    if scope == 0:
+        await _show(update, f"✅ Группа добавлена (без аккаунта).\n\n{groups_text(uid)}", groups_kb(uid))
+        return
     if db.get_accounts(uid):
         await _show(update, "✅ Группа добавлена. С какого аккаунта в неё выкладывать?",
                     account_picker_kb(uid, gid))
@@ -392,20 +470,28 @@ async def g_setacc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db.set_group_account(gid, a["id"] if a else None)
     await update.callback_query.answer("Сохранено")
-    who = f"аккаунт «{a['name']}»" if a else "без аккаунта"
-    await _show(update, f"✅ «{g['name']}»: {who}.\n\nТвои группы:", groups_kb(uid))
+    who = f"перенесена в аккаунт «{a['name']}»" if a else "теперь без аккаунта"
+    await _show(update, f"✅ «{g['name']}» {who}.\n\n{groups_text(uid)}", groups_kb(uid))
 
 
 # ─── Аккаунты (страница VK + профиль ManyFaces) ───────────────────────────────
 
 def accounts_kb(telegram_id: int) -> InlineKeyboardMarkup:
     rows = []
+    cur = current_scope(telegram_id)
     for a in db.get_accounts(telegram_id):
-        rows.append([InlineKeyboardButton(f"{accounts.account_line(a)} · групп {a['n_groups']}",
+        mark = "✅ " if a["id"] == cur else ""
+        rows.append([InlineKeyboardButton(f"{mark}{accounts.account_line(a)} · групп {a['n_groups']}",
                                           callback_data="noop")])
-        rows.append([InlineKeyboardButton("🖥 Профиль", callback_data=f"a_chp:{a['id']}"),
-                     InlineKeyboardButton("✏️", callback_data=f"a_ren:{a['id']}"),
-                     InlineKeyboardButton("🗑", callback_data=f"a_del:{a['id']}")])
+        row = [] if a["id"] == cur else [InlineKeyboardButton("→ Перейти", callback_data=f"a_sw:{a['id']}")]
+        rows.append(row + [InlineKeyboardButton("🖥 Профиль", callback_data=f"a_chp:{a['id']}"),
+                           InlineKeyboardButton("✏️", callback_data=f"a_ren:{a['id']}"),
+                           InlineKeyboardButton("🗑", callback_data=f"a_del:{a['id']}")])
+    if cur is not None:                                 # группы без аккаунта — свой раздел
+        n = len(db.get_groups(telegram_id, 0))
+        mark = "✅ " if cur == 0 else ""
+        rows.append([InlineKeyboardButton(f"{mark}📂 Без аккаунта (профиль по умолчанию) · групп {n}",
+                                          callback_data="noop" if cur == 0 else "a_sw:0")])
     rows.append([InlineKeyboardButton("➕ Добавить аккаунт", callback_data="a_add")])
     rows.append([InlineKeyboardButton("🖥 Профили на ПК", callback_data="a_pc")])
     return InlineKeyboardMarkup(rows)
@@ -417,12 +503,27 @@ def profile_kb(prefix: str) -> InlineKeyboardMarkup:
 
 
 ACCOUNTS_HELP = ("Аккаунт — страница VK и профиль ManyFaces на ПК, в котором выполнен вход в неё. Группы "
-                 "аккаунта выкладываются из этого профиля, группы без аккаунта — профилем по умолчанию.")
+                 "аккаунта выкладываются из этого профиля, группы без аккаунта — профилем по умолчанию.\n"
+                 "✅ — выбранный аккаунт: «Группы», «Источники» и «Правила» показывают только его, новые группы "
+                 "и источники добавляются в него. Сменить — «→ Перейти».")
 ACCOUNT_ADDED = "✅ Аккаунт добавлен. Привяжи к нему группы в 👥 Группы (кнопка 🧑‍💻).\n\nТвои аккаунты:"
 
 
 async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _show(update, f"{ACCOUNTS_HELP}\n\nТвои аккаунты:", accounts_kb(update.effective_user.id))
+
+
+async def a_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«→ Перейти»: сделать аккаунт (или «📂 Без аккаунта») выбранным."""
+    aid = int(update.callback_query.data.split(":")[1])
+    uid = update.effective_user.id
+    a = db.get_account(aid) if aid else None
+    if aid and (not a or a["telegram_id"] != uid):
+        await update.callback_query.answer("Аккаунт не найден")
+        return
+    db.set_current_account(uid, aid)
+    await update.callback_query.answer("✅ Аккаунт переключён")
+    await _show(update, f"Выбран: {scope_name(aid)}.\n\n{ACCOUNTS_HELP}\n\nТвои аккаунты:", accounts_kb(uid))
 
 
 async def a_pc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -562,7 +663,7 @@ async def g_ren(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def g_rename_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     db.rename_group(context.user_data.pop("g_rename"), update.message.text.strip()[:100])
-    await update.message.reply_text("✅ Переименовано.\n\nТвои группы:", reply_markup=groups_kb(uid))
+    await update.message.reply_text(f"✅ Переименовано.\n\n{groups_text(uid)}", reply_markup=groups_kb(uid))
     return ConversationHandler.END
 
 
@@ -572,7 +673,7 @@ async def g_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if g and g["telegram_id"] == update.effective_user.id:
         db.delete_group(gid)
     await update.callback_query.answer("Удалено (вместе с правилами группы)")
-    await _show(update, "Твои группы:", groups_kb(update.effective_user.id))
+    await _show(update, groups_text(update.effective_user.id), groups_kb(update.effective_user.id))
 
 
 # ─── Заготовки описаний ───────────────────────────────────────────────────────
@@ -639,21 +740,39 @@ async def t_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Источники ────────────────────────────────────────────────────────────────
 
-async def show_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sources = db.get_sources(update.effective_user.id)
-    lines = ["🎬 Источники:"] + [
+def sources_view(uid: int, page: int = 0):
+    """Текст и кнопки страницы источников выбранного аккаунта (вместе с общими, без владельца)."""
+    items, page, pages = _page(db.get_sources(uid, current_scope(uid)), page, PAGE_SOURCES)
+    lines = [scope_head(uid, "🎬 Источники")] + [
         f"• {s['name']} ({'TikTok @' + s['account'] if s['kind'] == 'account' else 'база парсера'})"
-        for s in sources
-    ] if sources else ["Источников пока нет."]
+        + ("" if s["owner_account_id"] or current_scope(uid) is None else " · общий")
+        for s in items
+    ] if items else [scope_head(uid, "🎬 Источники"), "Источников пока нет."]
     rows = []
-    for s in sources:
+    for s in items:
         row = [(f"🗑 {s['name']}", f"s_del:{s['id']}")]
         if s["kind"] == "account":
             row.insert(0, (f"📥 Всё {s['name']}", f"s_all:{s['id']}"))
             row.insert(0, (f"🔄 {s['name']}", f"s_ref:{s['id']}"))
         rows.append(row)
-    rows.append([("➕ TikTok-аккаунт", "s_add_acc"), ("➕ База парсера", "s_add_db")])
-    await _reply(update, "\n".join(lines), _kb(rows))
+    kb = [[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows]
+    nav = _nav("s_pg:", page, pages)
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("➕ TikTok-аккаунт", callback_data="s_add_acc"),
+               InlineKeyboardButton("➕ База парсера", callback_data="s_add_db")])
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def show_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text, kb = sources_view(update.effective_user.id)
+    await _reply(update, text, kb)
+
+
+async def s_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    text, kb = sources_view(update.effective_user.id, int(update.callback_query.data.split(":")[1]))
+    await _show(update, text, kb)
 
 
 async def s_add_acc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -668,7 +787,8 @@ async def s_nick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception as e:
         await update.message.reply_text(f"Не разобрал аккаунт: {e}\nПопробуй ещё раз или /cancel.")
         return S_NICK
-    sid = db.add_source(uid, f"@{username}", "", None, kind="account", account=username)
+    sid = db.add_source(uid, f"@{username}", "", None, kind="account", account=username,
+                        owner_account_id=current_scope(uid))
     path = account_source.source_db_path(sid)
     db.set_source_db_path(sid, path)
     msg = await update.message.reply_text("⏳ Парсю весь аккаунт, это может занять минуту…")
@@ -712,7 +832,8 @@ async def s_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     username = None if raw in ("-", "") else raw.lstrip("@")
     path = context.user_data.pop("s_path")
     name = os.path.splitext(os.path.basename(path))[0] + (f" ({username})" if username else "")
-    db.add_source(update.effective_user.id, name, path, username)
+    db.add_source(update.effective_user.id, name, path, username,
+                  owner_account_id=current_scope(update.effective_user.id))
     await update.message.reply_text("✅ Источник добавлен.", reply_markup=MENU)
     return ConversationHandler.END
 
@@ -764,13 +885,17 @@ async def s_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── Правила ──────────────────────────────────────────────────────────────────
 
-def rules_kb(telegram_id: int) -> InlineKeyboardMarkup:
+def rules_kb(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
     rows = []
-    for r in db.get_rules(telegram_id):
+    items, page, pages = _page(db.get_rules(telegram_id, current_scope(telegram_id)), page, PAGE_RULES)
+    for r in items:
         mark = "✅" if r["enabled"] else "⏸"
         rows.append([InlineKeyboardButton(
             f"{mark} {r['source_name']} → {r['group_name']} · {r['videos_per_day']}/день",
             callback_data=f"rd:{r['id']}")])
+    nav = _nav("r_pg:", page, pages)
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Добавить правило", callback_data="r_add")])
     return InlineKeyboardMarkup(rows)
 
@@ -807,7 +932,15 @@ def _own_rule(update: Update, rid: int):
 
 
 async def show_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _show(update, "Твои правила (источник → группа):", rules_kb(update.effective_user.id))
+    uid = update.effective_user.id
+    await _show(update, scope_head(uid, "Правила (источник → группа)"), rules_kb(uid))
+
+
+async def r_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
+    uid = update.effective_user.id
+    await _show(update, scope_head(uid, "Правила (источник → группа)"),
+                rules_kb(uid, int(update.callback_query.data.split(":")[1])))
 
 
 async def r_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -845,22 +978,53 @@ async def r_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _show(update, rule_detail_text(r), rule_detail_kb(r))
 
 
+def _picker(items: list, label, pick: str, pager: str, page: int) -> InlineKeyboardMarkup:
+    part, page, pages = _page(items, page, PAGE_PICK)
+    rows = [[InlineKeyboardButton(label(x), callback_data=f"{pick}{x['id']}")] for x in part]
+    nav = _nav(pager, page, pages)
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+def _source_picker(uid: int, page: int = 0) -> InlineKeyboardMarkup:
+    return _picker(db.get_sources(uid, current_scope(uid)), lambda s: s["name"], "r_src:", "r_srcp:", page)
+
+
+def _group_picker(uid: int, page: int = 0) -> InlineKeyboardMarkup:
+    return _picker(db.get_groups(uid, current_scope(uid)), lambda g: f"{g['name']} (id {g['vk_group_id']})",
+                   "r_grp:", "r_grpp:", page)
+
+
 async def r_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
-    sources, groups = db.get_sources(uid), db.get_groups(uid)
+    scope = current_scope(uid)
+    sources, groups = db.get_sources(uid, scope), db.get_groups(uid, scope)
     if not sources or not groups:
-        await _show(update, "Сначала добавь хотя бы одну группу и один источник.")
+        where = f" в {scope_name(scope)}" if scope is not None else ""
+        await _show(update, f"Сначала добавь хотя бы одну группу и один источник{where}.")
         return ConversationHandler.END
+    await _show(update, "Выбери источник:", _source_picker(uid))
+    return R_SRC
+
+
+async def r_src_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
     await _show(update, "Выбери источник:",
-                _kb([[(s["name"], f"r_src:{s['id']}")] for s in sources]))
+                _source_picker(update.effective_user.id, int(update.callback_query.data.split(":")[1])))
     return R_SRC
 
 
 async def r_src(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["r_src"] = int(update.callback_query.data.split(":")[1])
-    groups = db.get_groups(update.effective_user.id)
+    await _show(update, "Выбери группу:", _group_picker(update.effective_user.id))
+    return R_GRP
+
+
+async def r_grp_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
     await _show(update, "Выбери группу:",
-                _kb([[(f"{g['name']} (id {g['vk_group_id']})", f"r_grp:{g['id']}")] for g in groups]))
+                _group_picker(update.effective_user.id, int(update.callback_query.data.split(":")[1])))
     return R_GRP
 
 
@@ -1074,8 +1238,10 @@ def build_app() -> Application:
             S_NICK: [MessageHandler(plain, s_nick)],
             S_PATH: [MessageHandler(plain, s_path)],
             S_USER: [MessageHandler(plain, s_user)],
-            R_SRC: [CallbackQueryHandler(r_src, pattern=r"^r_src:\d+$")],
-            R_GRP: [CallbackQueryHandler(r_grp, pattern=r"^r_grp:\d+$")],
+            R_SRC: [CallbackQueryHandler(r_src, pattern=r"^r_src:\d+$"),
+                    CallbackQueryHandler(r_src_page, pattern=r"^r_srcp:\d+$")],
+            R_GRP: [CallbackQueryHandler(r_grp, pattern=r"^r_grp:\d+$"),
+                    CallbackQueryHandler(r_grp_page, pattern=r"^r_grpp:\d+$")],
             R_N: [MessageHandler(plain, r_n)],
             R_EDIT_VALUE: [MessageHandler(plain, r_edit_save)],
             R_DESC_PICK: [CallbackQueryHandler(r_desc_pick, pattern=r"^(rtpl:\d+|rdesc_manual|rdesc_clear)$")],
@@ -1101,6 +1267,10 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(g_setacc, pattern=r"^g_setacc:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(a_del, pattern=r"^a_del:\d+$"))
     app.add_handler(CallbackQueryHandler(a_pc, pattern=r"^a_pc$"))
+    app.add_handler(CallbackQueryHandler(a_switch, pattern=r"^a_sw:\d+$"))
+    app.add_handler(CallbackQueryHandler(g_page, pattern=r"^g_pg:\d+$"))
+    app.add_handler(CallbackQueryHandler(s_page, pattern=r"^s_pg:\d+$"))
+    app.add_handler(CallbackQueryHandler(r_page, pattern=r"^r_pg:\d+$"))
     app.add_handler(CallbackQueryHandler(a_chp, pattern=r"^a_chp:\d+$"))
     app.add_handler(CallbackQueryHandler(a_setp, pattern=r"^a_setp:\d+:.+$"))
     app.add_handler(CommandHandler("accounts", show_accounts))

@@ -189,6 +189,11 @@ def init_db() -> None:
             # удалили аккаунт — группа остаётся, просто без аккаунта
             conn.execute("ALTER TABLE groups ADD COLUMN account_id INTEGER "
                          "REFERENCES accounts(id) ON DELETE SET NULL")
+        source_cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
+        if "owner_account_id" not in source_cols:
+            # чей источник: NULL — общий (виден во всех аккаунтах), иначе — аккаунта, в котором его добавили
+            conn.execute("ALTER TABLE sources ADD COLUMN owner_account_id INTEGER "
+                         "REFERENCES accounts(id) ON DELETE SET NULL")
         queue_cols = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
         if "video_description" not in queue_cols:
             conn.execute("ALTER TABLE queue ADD COLUMN video_description TEXT")
@@ -293,12 +298,22 @@ def pc_profiles_synced_at() -> int | None:
 
 # ─── Группы ───────────────────────────────────────────────────────────────────
 
-def get_groups(telegram_id: int) -> list[sqlite3.Row]:
+def _scope(column: str, scope) -> tuple[str, tuple]:
+    """Отбор по аккаунту для меню бота. scope: None — всё, 0 — без аккаунта, N — аккаунт N."""
+    if scope is None:
+        return "", ()
+    if scope == 0:
+        return f" AND {column} IS NULL", ()
+    return f" AND {column} = ?", (scope,)
+
+
+def get_groups(telegram_id: int, scope=None) -> list[sqlite3.Row]:
+    where, args = _scope("g.account_id", scope)
     with _connect() as conn:
         return conn.execute(
             "SELECT g.*, a.name AS account_name, a.vk_user_id AS account_vk_id, a.profile_id AS profile_id "
             "FROM groups g LEFT JOIN accounts a ON a.id = g.account_id "
-            "WHERE g.telegram_id = ? ORDER BY g.id", (telegram_id,)
+            "WHERE g.telegram_id = ?" + where + " ORDER BY g.id", (telegram_id, *args)
         ).fetchall()
 
 
@@ -333,10 +348,16 @@ def delete_group(group_row_id: int) -> None:
 
 # ─── Источники ────────────────────────────────────────────────────────────────
 
-def get_sources(telegram_id: int) -> list[sqlite3.Row]:
+def get_sources(telegram_id: int, scope=None) -> list[sqlite3.Row]:
+    """scope: None — все; иначе источники этого аккаунта и общие (без владельца)."""
+    where, args = "", ()
+    if scope:
+        where, args = " AND (owner_account_id = ? OR owner_account_id IS NULL)", (scope,)
+    elif scope == 0:
+        where = " AND owner_account_id IS NULL"
     with _connect() as conn:
         return conn.execute(
-            "SELECT * FROM sources WHERE telegram_id = ? ORDER BY id", (telegram_id,)
+            "SELECT * FROM sources WHERE telegram_id = ?" + where + " ORDER BY id", (telegram_id, *args)
         ).fetchall()
 
 
@@ -347,13 +368,13 @@ def get_source(source_id: int) -> sqlite3.Row | None:
 
 def add_source(
     telegram_id: int, name: str, db_path: str, username: str | None,
-    *, kind: str = "db", account: str | None = None,
+    *, kind: str = "db", account: str | None = None, owner_account_id: int | None = None,
 ) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO sources (telegram_id, name, db_path, username, kind, account) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (telegram_id, name, db_path, username, kind, account),
+            "INSERT INTO sources (telegram_id, name, db_path, username, kind, account, owner_account_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (telegram_id, name, db_path, username, kind, account, owner_account_id or None),
         )
         return cur.lastrowid
 
@@ -400,10 +421,12 @@ _RULE_SELECT = """
 """
 
 
-def get_rules(telegram_id: int) -> list[sqlite3.Row]:
+def get_rules(telegram_id: int, scope=None) -> list[sqlite3.Row]:
+    """scope: None — все правила; 0 — правила групп без аккаунта; N — правила групп аккаунта N."""
+    where, args = _scope("g.account_id", scope)
     with _connect() as conn:
         return conn.execute(
-            _RULE_SELECT + " WHERE r.telegram_id = ? ORDER BY r.id", (telegram_id,)
+            _RULE_SELECT + " WHERE r.telegram_id = ?" + where + " ORDER BY r.id", (telegram_id, *args)
         ).fetchall()
 
 
@@ -789,3 +812,15 @@ def cleanup_old_errors(days: int) -> int:
     with _connect() as conn:
         cur = conn.execute("DELETE FROM error_logs WHERE created_at < ?", (cutoff,))
         return cur.rowcount
+
+
+# ─── Текущий аккаунт в боте (как в omega: меню показывает только его) ──────────
+
+def get_current_account(telegram_id: int) -> int | None:
+    """Выбранный в боте аккаунт: id, 0 — «без аккаунта», None — не выбран."""
+    value = get_setting(f"current_account:{telegram_id}")
+    return int(value) if value not in (None, "") else None
+
+
+def set_current_account(telegram_id: int, account_id: int | None) -> None:
+    set_setting(f"current_account:{telegram_id}", "" if account_id is None else int(account_id))
