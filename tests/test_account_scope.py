@@ -36,8 +36,9 @@ def test_lists_are_filtered_by_the_chosen_account():
     assert _ids(db.get_groups(UID, a1)) == [g1]
     assert _ids(db.get_groups(UID, 0)) == [g3]                       # «📂 Без аккаунта»
     assert _ids(db.get_groups(UID)) == [g1, g2, g3]                  # без отбора — всё
-    assert _ids(db.get_sources(UID, a1)) == [s_shared, s_a1]         # свои + общие
-    assert _ids(db.get_sources(UID, a2)) == [s_shared]
+    assert _ids(db.get_sources(UID, a1)) == [s_a1]                   # у аккаунта только свои
+    assert _ids(db.get_sources(UID, a2)) == []
+    assert _ids(db.get_sources(UID, 0)) == [s_shared]                # без владельца — «без аккаунта»
     assert [r["group_id"] for r in db.get_rules(UID, a2)] == [g2]
     assert [r["group_id"] for r in db.get_rules(UID, 0)] == [g3]
 
@@ -79,3 +80,24 @@ def test_long_lists_get_arrows_instead_of_endless_buttons():
         db.add_source(UID, f"src{i}", f"/{i}.db", None)
     _, skb = bot.sources_view(UID)
     assert "s_pg:1" in [b.callback_data for row in skb.inline_keyboard for b in row]
+
+
+
+def test_old_sources_are_given_to_the_accounts_of_their_rules():
+    import sqlite3
+    a1, a2, (g1, g2, g3), (s_shared, s_a1) = _setup()       # s_shared кормит группы a1, a2 и без аккаунта
+    lonely = db.add_source(UID, "без правил", "/z.db", None)
+    conn = sqlite3.connect(db.DB_PATH)                        # как в базе до появления владельцев
+    conn.execute("UPDATE sources SET owner_account_id = NULL")
+    conn.execute("DELETE FROM settings WHERE key = 'sources_owned_v1'")
+    conn.commit(); conn.close()
+    db.init_db()                                              # миграция при старте
+    by_group = {r["group_id"]: r["source_id"] for r in db.get_rules(UID)}
+    assert by_group[g1] == s_shared and db.get_source(s_shared)["owner_account_id"] == a1
+    assert by_group[g2] != s_shared and db.get_source(by_group[g2])["owner_account_id"] == a2   # своя копия
+    assert db.get_source(by_group[g2])["db_path"] == "/x.db"                                    # тот же файл
+    assert db.get_source(by_group[g3])["owner_account_id"] is None and by_group[g3] == s_a1     # s_a1: только g3
+    assert db.get_source(lonely)["owner_account_id"] is None                                    # без правил
+    n = len(db.get_sources(UID))
+    db.init_db()                                              # второй запуск ничего не меняет
+    assert len(db.get_sources(UID)) == n

@@ -741,11 +741,10 @@ async def t_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── Источники ────────────────────────────────────────────────────────────────
 
 def sources_view(uid: int, page: int = 0):
-    """Текст и кнопки страницы источников выбранного аккаунта (вместе с общими, без владельца)."""
+    """Текст и кнопки страницы источников выбранного аккаунта (у каждого аккаунта свои, как группы)."""
     items, page, pages = _page(db.get_sources(uid, current_scope(uid)), page, PAGE_SOURCES)
     lines = [scope_head(uid, "🎬 Источники")] + [
         f"• {s['name']} ({'TikTok @' + s['account'] if s['kind'] == 'account' else 'база парсера'})"
-        + ("" if s["owner_account_id"] or current_scope(uid) is None else " · общий")
         for s in items
     ] if items else [scope_head(uid, "🎬 Источники"), "Источников пока нет."]
     rows = []

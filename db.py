@@ -191,12 +191,44 @@ def init_db() -> None:
                          "REFERENCES accounts(id) ON DELETE SET NULL")
         source_cols = {row[1] for row in conn.execute("PRAGMA table_info(sources)")}
         if "owner_account_id" not in source_cols:
-            # чей источник: NULL — общий (виден во всех аккаунтах), иначе — аккаунта, в котором его добавили
+            # чей источник: аккаунта (как группа); NULL — источник раздела «без аккаунта»
             conn.execute("ALTER TABLE sources ADD COLUMN owner_account_id INTEGER "
                          "REFERENCES accounts(id) ON DELETE SET NULL")
+        _assign_source_owners(conn)
         queue_cols = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
         if "video_description" not in queue_cols:
             conn.execute("ALTER TABLE queue ADD COLUMN video_description TEXT")
+
+
+def _assign_source_owners(conn) -> None:
+    """Один раз: источники, добавленные до появления владельца, отдать аккаунтам — по группам их правил.
+    Если источник кормит группы нескольких аккаунтов (или и группы без аккаунта), у каждого появляется своя
+    копия (тот же файл базы, те же настройки), и правила этих групп переводятся на неё: выдача не меняется.
+    Источники без правил остаются в разделе «без аккаунта»."""
+    if conn.execute("SELECT 1 FROM settings WHERE key = 'sources_owned_v1'").fetchone():
+        return
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sources)") if r[1] not in ("id", "owner_account_id")]
+    for src in conn.execute("SELECT * FROM sources WHERE owner_account_id IS NULL ORDER BY id").fetchall():
+        owners = [r[0] for r in conn.execute(           # аккаунты групп его правил, по порядку правил
+            "SELECT g.account_id FROM rules r JOIN groups g ON g.id = r.group_id "
+            "WHERE r.source_id = ? GROUP BY g.account_id ORDER BY MIN(r.id)", (src["id"],)).fetchall()]
+        accounts_ = [a for a in owners if a is not None]
+        if not accounts_:
+            continue                                     # без правил или только группы без аккаунта
+        conn.execute("UPDATE sources SET owner_account_id = ? WHERE id = ?", (accounts_[0], src["id"]))
+        for owner in owners:
+            if owner == accounts_[0]:
+                continue
+            new_id = conn.execute(
+                f"INSERT INTO sources ({', '.join(cols)}, owner_account_id) "
+                f"SELECT {', '.join(cols)}, ? FROM sources WHERE id = ?", (owner, src["id"])).lastrowid
+            same = "g.account_id IS NULL" if owner is None else "g.account_id = ?"
+            args = () if owner is None else (owner,)
+            conn.execute(
+                "UPDATE rules SET source_id = ? WHERE source_id = ? AND group_id IN "
+                f"(SELECT g.id FROM groups g WHERE {same})", (new_id, src["id"], *args))
+    conn.execute("INSERT INTO settings (key, value) VALUES ('sources_owned_v1', '1') "
+                 "ON CONFLICT(key) DO NOTHING")
 
 
 # ─── Пользователи ─────────────────────────────────────────────────────────────
@@ -349,12 +381,8 @@ def delete_group(group_row_id: int) -> None:
 # ─── Источники ────────────────────────────────────────────────────────────────
 
 def get_sources(telegram_id: int, scope=None) -> list[sqlite3.Row]:
-    """scope: None — все; иначе источники этого аккаунта и общие (без владельца)."""
-    where, args = "", ()
-    if scope:
-        where, args = " AND (owner_account_id = ? OR owner_account_id IS NULL)", (scope,)
-    elif scope == 0:
-        where = " AND owner_account_id IS NULL"
+    """scope: None — все; 0 — источники без аккаунта; N — источники аккаунта N (у каждого свои, как группы)."""
+    where, args = _scope("owner_account_id", scope)
     with _connect() as conn:
         return conn.execute(
             "SELECT * FROM sources WHERE telegram_id = ?" + where + " ORDER BY id", (telegram_id, *args)
